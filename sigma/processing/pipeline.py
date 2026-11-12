@@ -20,6 +20,7 @@ from typing import (
 )
 
 from sigma.processing.condition_expressions import ConditionExpression, parse_condition_expression
+from sigma.conversion.budget import current_budget
 from sigma.processing.conditions.base import ProcessingCondition
 from sigma.processing.finalization import Finalizer, NestedFinalizer, finalizers
 from sigma.processing.templates import TemplateBase
@@ -572,7 +573,14 @@ class ProcessingItem(ProcessingItemBase):
         if self.match_rule_conditions(
             rule
         ):  # apply transformation if conditions match or no condition defined
-            self.transformation.apply(rule)
+            budget = current_budget()
+            if budget is not None:
+                budget.begin_processing_item(self.identifier)
+            try:
+                self.transformation.apply(rule)
+            finally:
+                if budget is not None:
+                    budget.end_processing_item()
             return True
         else:  # just pass rule through
             return False

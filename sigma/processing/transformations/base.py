@@ -6,6 +6,7 @@ import types
 from typing import Any, Iterable, Union, get_type_hints, TYPE_CHECKING
 from dataclasses import dataclass, field
 from sigma.conditions import ConditionOR
+from sigma.conversion.budget import STAGE_FIELD_MAPPING, charge_budget
 from sigma.correlations import SigmaCorrelationCondition, SigmaCorrelationRule
 from sigma.processing.regex import ProcessingRegularExpressionMixin
 from sigma.rule import SigmaRule, SigmaDetection, SigmaDetectionItem
@@ -287,10 +288,14 @@ class FieldMappingTransformationBase(DetectionItemTransformation):
             if isinstance(value, SigmaFieldReference) and (
                 self.processing_item is None or self.processing_item.match_field_in_value(value)
             ):
+                mapped_fields = self._apply_field_name(value.field)
+                # Each additional target field beyond the original one is an extra candidate
+                # produced by the one-to-many field reference mapping.
+                charge_budget(max(0, len(mapped_fields) - 1), STAGE_FIELD_MAPPING)
                 new_values.extend(
                     (
                         SigmaFieldReference(mapped_field, value.starts_with, value.ends_with)
-                        for mapped_field in self._apply_field_name(value.field)
+                        for mapped_field in mapped_fields
                     )
                 )
                 fieldref_match = True
@@ -323,6 +328,11 @@ class FieldMappingTransformationBase(DetectionItemTransformation):
                 self.processing_item_applied(detection_item)
                 result = detection_item
             else:
+                # One-to-many mapping: each target field beyond the first creates an
+                # additional detection item that becomes an extra query subexpression. The
+                # charge is raised before the replacement detection is built so that a field
+                # fanning out to very many targets is rejected without materializing them.
+                charge_budget(len(mapping) - 1, STAGE_FIELD_MAPPING)
                 result = SigmaDetection(
                     [
                         dataclasses.replace(detection_item, field=field, auto_modifiers=False)

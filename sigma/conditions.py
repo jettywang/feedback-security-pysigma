@@ -17,6 +17,7 @@ from pyparsing import (
     ParserElement,
 )
 from typing import ClassVar, Type, TypeVar, cast, TYPE_CHECKING
+from sigma.conversion.budget import STAGE_CONDITION_SELECTOR, charge_budget
 from sigma.types import SigmaType
 from sigma.exceptions import SigmaConditionError, SigmaRuleLocation
 
@@ -286,6 +287,10 @@ class ConditionSelector(ConditionItem):
                 f"Selector '{ self.args[0] } of { self.pattern }' doesn't match any detection",
                 source=source,
             )
+        # Charge one candidate per detection identifier the selector fans out into. This is
+        # counted before the identifier conditions are themselves expanded so that a selector
+        # matching many detections aborts early instead of building the whole AND/OR tree.
+        charge_budget(len(ids), STAGE_CONDITION_SELECTOR)
         cond = self.cond_class(
             cast(
                 list[

@@ -6,6 +6,7 @@ from typing import Any, TYPE_CHECKING
 from typing import Self
 
 import sigma.exceptions as sigma_exceptions
+from sigma.conversion.budget import current_budget
 from sigma.exceptions import SigmaError, SigmaRuleLocation
 from sigma.processing.tracking import ProcessingItemTrackingMixin
 from sigma.rule.base import SigmaRuleBase
@@ -66,6 +67,11 @@ class SigmaRule(SigmaRuleBase, ProcessingItemTrackingMixin):
 
         # parse detections
         try:
+            # Attribute modifier expansion charged while the detection section is parsed to
+            # this rule, even though the SigmaRule instance does not exist yet at that point.
+            budget = current_budget()
+            if budget is not None:
+                budget.begin_rule_label(rule.get("title") or rule.get("name") or rule.get("id"))
             detections = SigmaDetections.from_dict(rule["detection"], source, policy=policy)
         except KeyError:
             detections = EmptySigmaDetections()

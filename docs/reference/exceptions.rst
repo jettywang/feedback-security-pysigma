@@ -48,6 +48,10 @@ Backend and Conversion Exceptions
 .. autoclass:: sigma.exceptions.SigmaFeatureNotSupportedByBackendError
    :show-inheritance:
 
+.. autoclass:: sigma.exceptions.SigmaComplexityBudgetExceededError
+   :show-inheritance:
+   :members:
+
 Pipeline and Processing Exceptions
 ------------------------------------
 

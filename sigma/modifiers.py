@@ -41,6 +41,7 @@ from sigma.types import (
     SigmaStringPartType,
 )
 from sigma.exceptions import SigmaModifiedError, SigmaRuleLocation, SigmaTypeError, SigmaValueError
+from sigma.conversion.budget import STAGE_MODIFIER_EXPANSION, charge_budget
 
 if TYPE_CHECKING:
     from .rule import SigmaDetectionItem
@@ -112,7 +113,7 @@ class SigmaModifier(ABC, Generic[T, R]):
         * Handle values of SigmaExpansion objects separately.
         """
         if isinstance(val, SigmaExpansion):  # Handle each SigmaExpansion item separately
-            return [
+            expanded = [
                 cast(
                     T,
                     SigmaExpansion(
@@ -120,6 +121,7 @@ class SigmaModifier(ABC, Generic[T, R]):
                     ),
                 )
             ]
+            return expanded
         else:
             if not self.type_check(val):
                 raise SigmaTypeError(
@@ -128,9 +130,18 @@ class SigmaModifier(ABC, Generic[T, R]):
                 )
             r = self.modify(val)
             if isinstance(r, list):
-                return [cast(T, item) for item in r]
+                result = [cast(T, item) for item in r]
             else:
-                return [cast(T, r)]
+                result = [cast(T, r)]
+            # Only the additional candidates produced by an expanding modifier are charged.
+            # Modifiers that map one value onto exactly one value (e.g. base64) are linear and
+            # therefore consume no budget. The charge happens as the values are produced, so a
+            # modifier that explodes a value aborts before the full expansion is materialized.
+            expansion_growth = sum(
+                len(item.values) if isinstance(item, SigmaExpansion) else 1 for item in result
+            ) - 1
+            charge_budget(max(0, expansion_growth), STAGE_MODIFIER_EXPANSION)
+            return result
 
 
 class SigmaValueModifier(SigmaModifier[T, R]):

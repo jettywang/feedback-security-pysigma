@@ -1,4 +1,5 @@
 import re
+import copy
 import string
 from abc import ABC, abstractmethod
 from collections import ChainMap, defaultdict
@@ -16,6 +17,12 @@ from sigma.conditions import (
     ConditionNOT,
     ConditionOR,
     ConditionValueExpression,
+)
+from sigma.conversion.budget import (
+    ComplexityBudget,
+    activate_budget,
+    current_budget,
+    deactivate_budget,
 )
 from sigma.conversion.deferred import DeferredQueryExpression
 from sigma.conversion.state import ConversionState
@@ -36,6 +43,7 @@ from sigma.correlations import (
 )
 from sigma.exceptions import (
     SigmaBackendError,
+    SigmaComplexityBudgetExceededError,
     SigmaConversionError,
     SigmaError,
     SigmaFeatureNotSupportedByBackendError,
@@ -163,16 +171,27 @@ class Backend(ABC):
         None  # Value returned when AND expression has no arguments
     )
 
+    # Shared complexity budget for one conversion run. It bounds the number of intermediate
+    # nodes/candidates produced by condition selectors, expanding value modifiers and
+    # one-to-many field mappings. None disables the budget (unbounded, legacy behavior).
+    complexity_budget: ClassVar[int | None] = None
+
     def __init__(
         self,
         processing_pipeline: ProcessingPipeline | None = None,
         collect_errors: bool = False,
+        complexity_budget: int | None = None,
         **backend_options: dict[str, Any],
     ):
         self.processing_pipeline: ProcessingPipeline | None = processing_pipeline
         self.errors = []
         self.collect_errors: bool = collect_errors
         self.backend_options: dict[str, dict[str, Any]] = backend_options
+        # An explicit constructor argument overrides the class-level default.
+        self.complexity_budget: int | None = (
+            complexity_budget if complexity_budget is not None else type(self).complexity_budget
+        )
+        self._active_budget: ComplexityBudget | None = None
 
     def init_processing_pipeline(self, output_format: str | None = None) -> None:
         """
@@ -218,18 +237,124 @@ class Backend(ABC):
         """
         self.init_processing_pipeline(output_format)
         rule_collection.resolve_rule_references()
-        queries = [
-            query
-            for rule in rule_collection.rules
-            for query in (
-                self.convert_rule(rule, output_format or self.default_format, callback)
-                if isinstance(rule, SigmaRule)
-                else self.convert_correlation_rule(
-                    rule, output_format or self.default_format, correlation_method, callback
+        budget_token, owns_budget = self._start_budget()
+        try:
+            queries = [
+                query
+                for rule in rule_collection.rules
+                for query in (
+                    self._convert_rule(rule, output_format or self.default_format, callback)
+                    if isinstance(rule, SigmaRule)
+                    else self.convert_correlation_rule(
+                        rule, output_format or self.default_format, correlation_method, callback
+                    )
                 )
+            ]
+            result = self.finalize(queries, output_format or self.default_format)
+        except SigmaComplexityBudgetExceededError:
+            # A budget failure must not leave partial expansion state behind that a later
+            # conversion could reuse: reset the reusable pipeline tracking structures so the
+            # next conversion starts from a clean state. This holds whether the budget was
+            # created here or installed by an outer parsing guard (convert_untrusted_yaml).
+            self._reset_pipeline_state()
+            raise
+        finally:
+            # Always release the budget, on success and on every failure path.
+            self._finish_budget(budget_token, owns_budget)
+        return result
+
+    def _convert_rule(
+        self,
+        rule: SigmaRule,
+        output_format: str,
+        callback: (
+            Callable[[SigmaRule | SigmaCorrelationRule, str | None, int, Any, Any], Any] | None
+        ),
+    ) -> list[Any]:
+        """Convert a SigmaRule, deep-copying it first while a budget is active.
+
+        The private copy ensures a pipeline that mutates the rule and then trips the budget
+        cannot leave a half-expanded rule object behind that the caller could reuse. When no
+        budget is active the rule is converted in place to preserve legacy behavior.
+        """
+        if self._active_budget is not None:
+            rule = copy.deepcopy(rule)
+        return self._convert_rule_impl(rule, output_format, callback)
+
+    def _start_budget(self) -> tuple[Any, bool]:
+        """
+        Create and activate the shared complexity budget for a conversion run.
+
+        Returns a ``(token, owns_budget)`` pair. When a budget is already active (e.g.
+        installed by :meth:`convert_untrusted_yaml` before rule parsing) it is reused so that
+        modifier expansion charged during parsing and the later pipeline/conversion costs
+        accumulate in one shared budget; in that case ``owns_budget`` is False and the budget
+        is released by the outer scope instead of this conversion.
+        """
+        active = current_budget()
+        if active is not None:
+            self._active_budget = active
+            return None, False
+        if self.complexity_budget is None:
+            return None, False
+        budget = ComplexityBudget(limit=self.complexity_budget)
+        self._active_budget = budget
+        return activate_budget(budget), True
+
+    def convert_untrusted_yaml(
+        self,
+        rule_yaml: str,
+        output_format: str | None = None,
+    ) -> Any:
+        """
+        Convert untrusted Sigma YAML under the shared complexity budget.
+
+        The budget is activated before the rule is parsed, so modifier expansion that happens
+        during parsing (e.g. ``base64offset`` / ``windash`` turning one value into several
+        candidates) is covered as well as selector expansion and one-to-many field mappings
+        that happen later in the processing pipeline and conversion.
+
+        When no budget is configured this is equivalent to parsing and converting the YAML
+        directly. A budget failure raises
+        :class:`~sigma.exceptions.SigmaComplexityBudgetExceededError` without mutating any
+        caller-owned rule object, because the rule is constructed inside the guarded scope.
+        """
+        if self.complexity_budget is None:
+            return self.convert(
+                SigmaCollection.from_yaml(rule_yaml), output_format or self.default_format
             )
-        ]
-        return self.finalize(queries, output_format or self.default_format)
+
+        budget = ComplexityBudget(limit=self.complexity_budget)
+        with budget:
+            rule_collection = SigmaCollection.from_yaml(rule_yaml)
+            # The same budget stays active through conversion (convert() reuses the active
+            # budget) so selector, field-mapping and modifier costs accumulate together. On a
+            # budget failure convert() resets the pipeline state; the context manager releases
+            # the budget and the rule object never leaves this scope.
+            return self.convert(rule_collection, output_format or self.default_format)
+
+    def _finish_budget(self, token: Any, owns_budget: bool) -> None:
+        """Deactivate the budget and clear the backend reference on every exit path."""
+        if owns_budget:
+            deactivate_budget(token)
+        self._active_budget = None
+
+    def _reset_pipeline_state(self) -> None:
+        """Reset the per-apply tracking state of the reusable processing pipeline."""
+        from dataclasses import fields as dataclass_fields
+
+        pipeline = getattr(self, "last_processing_pipeline", None)
+        if pipeline is not None:
+            field_mappings_factory = next(
+                field.default_factory
+                for field in dataclass_fields(type(pipeline))
+                if field.name == "field_mappings"
+            )
+            pipeline.applied = list()
+            pipeline.applied_ids = set()
+            pipeline.field_name_applied_ids = defaultdict(set)
+            pipeline.field_mappings = field_mappings_factory()
+            pipeline.state = dict()
 
     def convert_rule(
         self,
@@ -254,6 +379,33 @@ class Backend(ABC):
         Returns:
             List of converted queries
         """
+        # When called directly (outside Backend.convert) with a budget configured, this entry
+        # point owns its own budget lifecycle. Inside convert() a budget is already active and
+        # is reused instead. A private deep copy keeps a budget failure from mutating the rule
+        # object the caller passed in.
+        owns_budget = current_budget() is None and self.complexity_budget is not None
+        if owns_budget:
+            budget_token, owns_budget = self._start_budget()
+            rule = copy.deepcopy(rule)
+        else:
+            budget_token = None
+        try:
+            return self._convert_rule_impl(rule, output_format, callback)
+        except SigmaComplexityBudgetExceededError:
+            if owns_budget:
+                self._reset_pipeline_state()
+            raise
+        finally:
+            self._finish_budget(budget_token, owns_budget)
+
+    def _convert_rule_impl(
+        self,
+        rule: SigmaRule,
+        output_format: str | None = None,
+        callback: (
+            Callable[[SigmaRule | SigmaCorrelationRule, str | None, int, Any, Any], Any] | None
+        ) = None,
+    ) -> list[Any]:
         try:
             # Initialize processing pipeline if not already done
             if (
@@ -261,6 +413,11 @@ class Backend(ABC):
                 or self.last_processing_pipeline is None
             ):
                 self.init_processing_pipeline(output_format)
+
+            # Attribute all budget consumption of this rule to the rule itself.
+            budget = current_budget()
+            if budget is not None:
+                budget.begin_rule(rule)
 
             error_state = "applying processing pipeline on"
             self.last_processing_pipeline.apply(rule)  # 1. Apply transformations

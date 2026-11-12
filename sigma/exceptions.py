@@ -202,6 +202,37 @@ class SigmaSecurityError(SigmaError):
     pass
 
 
+class SigmaComplexityBudgetExceededError(SigmaError):
+    """
+    Conversion complexity budget was exhausted while expanding Sigma content.
+
+    The budget counts expanded intermediate nodes / candidates instead of input bytes or
+    elapsed time so that small inputs that would explode into a large query tree are rejected
+    while still being expanded, while large but linear rules stay convertible.
+
+    The error carries the location where the budget was consumed (rule and processing item or
+    expansion stage) to make the source of the exhaustion attributable.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        source: SigmaRuleLocation | None = None,
+        rule: str | None = None,
+        processing_item: str | None = None,
+        stage: str | None = None,
+        limit: int | None = None,
+        consumed: int | None = None,
+        **kwargs: dict[str, Any],
+    ) -> None:
+        super().__init__(*args, source=source, **kwargs)
+        self.rule = rule
+        self.processing_item = processing_item
+        self.stage = stage
+        self.limit = limit
+        self.consumed = consumed
+
+
 class SigmaTransformationError(SigmaError):
     """Error while transformation. Can be raised intentionally by FailureTransformation."""
 

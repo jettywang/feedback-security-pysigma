@@ -28,6 +28,19 @@ ConversionState
    :undoc-members:
    :show-inheritance:
 
+ComplexityBudget
+----------------
+
+.. autoclass:: sigma.conversion.budget.ComplexityBudget
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. autoclass:: sigma.conversion.budget.BudgetCharge
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 DeferredQueryExpression
 -----------------------
 
