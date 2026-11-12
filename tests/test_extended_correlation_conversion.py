@@ -23,6 +23,8 @@ detection:
     selection:
         EventID: 4625
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Successful logon
 name: successful_logon
@@ -34,6 +36,8 @@ detection:
     selection:
         EventID: 4624
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Failed and successful logons for a single user
 status: test
@@ -59,6 +63,8 @@ detection:
     selection:
         EventID: 4625
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Suspicious logon
 name: suspicious_logon
@@ -70,6 +76,8 @@ detection:
     selection:
         EventID: 4648
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Either failed or suspicious logon for a single user
 status: test
@@ -95,6 +103,8 @@ detection:
     selection:
         EventID: 4625
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Successful logon
 name: successful_logon
@@ -106,6 +116,8 @@ detection:
     selection:
         EventID: 4624
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Failed logon but not successful
 status: test
@@ -131,6 +143,8 @@ detection:
     selection:
         EventID: 4625
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Successful logon
 name: successful_logon
@@ -142,6 +156,8 @@ detection:
     selection:
         EventID: 4624
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Suspicious logon
 name: suspicious_logon
@@ -153,6 +169,8 @@ detection:
     selection:
         EventID: 4648
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Account lockout
 name: account_lockout
@@ -164,6 +182,8 @@ detection:
     selection:
         EventID: 4740
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Complex correlation condition
 status: test
@@ -189,6 +209,8 @@ detection:
     selection:
         EventID: 4625
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Successful logon
 name: successful_logon
@@ -200,6 +222,8 @@ detection:
     selection:
         EventID: 4624
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Administrative action
 name: admin_action
@@ -211,6 +235,8 @@ detection:
     selection:
         EventID: 4672
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Failed then successful logon then admin action
 status: test
@@ -303,6 +329,8 @@ detection:
     selection:
         field: a
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Rule B
 name: rule_b
@@ -313,6 +341,8 @@ detection:
     selection:
         field: b
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Rule C
 name: rule_c
@@ -323,6 +353,8 @@ detection:
     selection:
         field: c
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Precedence test
 status: test
@@ -355,6 +387,8 @@ detection:
     selection:
         field: a
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Rule B
 name: rule_b
@@ -365,6 +399,8 @@ detection:
     selection:
         field: b
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Rule C
 name: rule_c
@@ -375,6 +411,8 @@ detection:
     selection:
         field: c
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Parentheses test
 status: test
@@ -406,6 +444,8 @@ detection:
     selection:
         field: a
     condition: selection
+fields:
+    - TargetUserName
 ---
 title: Double negation test
 status: test

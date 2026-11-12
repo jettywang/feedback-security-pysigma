@@ -37,6 +37,7 @@ from sigma.correlations import (
 from sigma.exceptions import (
     SigmaBackendError,
     SigmaConversionError,
+    SigmaCorrelationFieldError,
     SigmaError,
     SigmaFeatureNotSupportedByBackendError,
     SigmaValueError,
@@ -697,6 +698,11 @@ class Backend(ABC):
             )
         self.last_processing_pipeline.apply(rule)
 
+        # After the processing pipeline ran, verify that every group-by correlation key can be
+        # represented for every referenced source rule. This must fail loudly instead of emitting
+        # a broad query that groups events of unrelated sources together.
+        self.validate_correlation_group_keys(rule)
+
         # Determine which conversion method to use based on type and condition type
         from sigma.correlations import SigmaExtendedCorrelationCondition
 
@@ -771,6 +777,18 @@ class Backend(ABC):
             return finalized_queries
         else:
             return []
+
+    def validate_correlation_group_keys(self, rule: SigmaCorrelationRule) -> None:
+        """
+        Validate after processing pipeline application that every group-by correlation key can be
+        represented for each source rule referenced by the correlation rule.
+
+        Backends which don't generate correlation queries (``correlation_methods is None``) don't
+        need to implement the check. Backends with correlation support override this method and
+        raise a :class:`SigmaCorrelationFieldError` pointing at the offending source rule and
+        correlation key if a key is not representable, instead of silently emitting a broad query.
+        """
+        return None
 
     @abstractmethod
     def convert_correlation_event_count_rule(
@@ -2582,6 +2600,115 @@ class TextQueryBackend(Backend):
         if isinstance(fieldref, list):
             return ", ".join(self.escape_and_quote_field(field) for field in fieldref)
         return self.escape_and_quote_field(fieldref)
+
+    def validate_correlation_group_keys(self, rule: SigmaCorrelationRule) -> None:
+        """
+        Validate that each group-by field of a correlation rule is a usable correlation key for
+        every referenced source rule after the processing pipeline was applied.
+
+        A group-by entry is handled in one of two ways:
+
+        * It is a declared field alias: every referenced source rule must provide exactly one
+          mapped field in the alias mapping. A missing entry means that events of this source have
+          no representation of the entity, and a backend without field normalization support can't
+          express the alias at all. Both cases must raise instead of silently collapsing the key
+          into a global grouping.
+        * It is a plain field name: plain names only describe the same entity when every referenced
+          source rule ends up with the identical field name after pipeline processing. Sources that
+          use a different field name for the same entity must declare an explicit alias; identical
+          names are never merged with differing names.
+
+        Errors are raised as :class:`SigmaCorrelationFieldError` and reference the concrete source
+        rule and correlation key that can't be represented.
+        """
+        if rule.group_by is None:
+            return
+
+        alias_definitions = {alias.alias: alias for alias in rule.aliases}
+        # A backend can only merge differently named source fields into an alias if it can emit
+        # field normalization expressions in the search phase.
+        normalization_supported = (
+            self.correlation_search_field_normalization_expression is not None
+            and self.correlation_search_field_normalization_expression_joiner is not None
+        )
+
+        for group_key in rule.group_by:
+            alias_definition = alias_definitions.get(group_key)
+            if alias_definition is not None:
+                if not normalization_supported and len(rule.referenced_rules) > 0:
+                    raise SigmaCorrelationFieldError(
+                        rule,
+                        rule.source,
+                        "Correlation field alias can't be converted because the backend does not "
+                        "support correlation field normalization expressions; use identical field "
+                        "names in the source rules or a backend able to normalize them.",
+                        field=group_key,
+                    )
+                for rule_reference in rule.referenced_rules:
+                    mapped_field = alias_definition.mapping.get(rule_reference)
+                    if not mapped_field:
+                        raise SigmaCorrelationFieldError(
+                            rule,
+                            rule.source,
+                            "Correlation field alias has no field mapping for this source rule; "
+                            "add an explicit alias mapping instead of silently grouping events "
+                            "without the correlation key.",
+                            field=group_key,
+                            source_rule=rule_reference.reference,
+                        )
+            else:
+                # Plain group-by field: without an alias the name must resolve identically in every
+                # referenced source rule. Differing source-specific names require an explicit alias
+                # and must not be merged by a broad global grouping. A single-rule correlation has
+                # no cross-source ambiguity, so the field name is accepted as-is like before.
+                if len(rule.referenced_rules) <= 1:
+                    continue
+                for rule_reference in rule.referenced_rules:
+                    if not self._source_rule_has_groupby_field(rule_reference, group_key):
+                        raise SigmaCorrelationFieldError(
+                            rule,
+                            rule.source,
+                            "Group-by field can't be resolved for this source rule; define a "
+                            "correlation field alias to map the source-specific field names to a "
+                            "shared entity instead of silently falling back to a global grouping.",
+                            field=group_key,
+                            source_rule=rule_reference.reference,
+                        )
+
+    def _source_rule_has_groupby_field(
+        self, rule_reference: SigmaRuleReference, field: str
+    ) -> bool:
+        """
+        Determine whether a referenced source rule provides a plain group-by field under the given
+        name after processing pipeline application.
+
+        A referenced rule can either be a regular Sigma rule or, in chained correlations, another
+        correlation rule. A nested correlation rule provides the keys of its own group-by list
+        (including declared aliases). For regular rules the field name must occur, after pipeline
+        processing, either in the rule's field list or in one of its detection items; source rules
+        that name the entity differently have to declare a field alias.
+        """
+        source_rule = rule_reference.rule
+        if isinstance(source_rule, SigmaCorrelationRule):
+            group_by = source_rule.group_by
+            return group_by is not None and field in group_by
+        if field in source_rule.fields:
+            return True
+        for detection in source_rule.detection.detections.values():
+            for detection_item in detection.detection_items:
+                if self._detection_contains_field(detection_item, field):
+                    return True
+        return False
+
+    def _detection_contains_field(
+        self, detection: SigmaDetection | SigmaDetectionItem, field: str
+    ) -> bool:
+        if isinstance(detection, SigmaDetection):
+            return any(
+                self._detection_contains_field(item, field)
+                for item in detection.detection_items
+            )
+        return detection.field == field
 
     def convert_correlation_search_field_normalization_expression(
         self,

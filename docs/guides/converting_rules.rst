@@ -239,6 +239,44 @@ statistical conditions. pySigma handles these through the same conversion interf
 The backend must support correlation rule conversion for this to work. Not all backends
 implement correlation support.
 
+Correlation field aliases and group-by validation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Different log sources often use different field names for the same entity, e.g. one rule
+matches ``user.name`` while another uses ``subject``. Such names are only treated as the
+same entity when the correlation rule declares an explicit field alias that maps the alias
+to one field per referenced source rule:
+
+.. code-block:: yaml
+
+   correlation:
+       type: event_count
+       rules:
+           - host_a_logon
+           - host_b_logon
+       aliases:
+           user:
+               host_a_logon: user.name
+               host_b_logon: subject
+       group-by:
+           - user
+       timespan: 5m
+       condition:
+           gte: 2
+
+After the processing pipeline was applied, pySigma validates every ``group-by``
+correlation key and raises a :class:`sigma.exceptions.SigmaCorrelationFieldError` that
+names the concrete source rule and correlation key instead of emitting a broad query that
+silently falls back to a global grouping when:
+
+* an aliased key has no field mapping for a referenced source rule;
+* a plain ``group-by`` field cannot be resolved in every referenced source rule (source
+  rules naming the entity differently must use an explicit alias);
+* the backend cannot emit the field normalization expressions required to represent an
+  alias;
+* the pipeline maps one aliased source field to several fields, which cannot be used as a
+  single correlation key.
+
 Complete Workflow Example
 -------------------------
 

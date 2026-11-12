@@ -236,7 +236,11 @@ class FieldMappingTransformationBase(DetectionItemTransformation):
                         mapped_field_name = self._apply_field_name(field_name)
                         if len(mapped_field_name) > 1:
                             raise SigmaConfigurationError(
-                                "Field name mapping transformation can't be applied to correlation rule alias mapping because it results in multiple field names."
+                                "Field name mapping transformation can't be applied to correlation "
+                                f"rule alias mapping of correlation key '{alias.alias}' for source "
+                                f"rule '{rule_reference.reference}': field '{field_name}' is mapped "
+                                f"to multiple fields {mapped_field_name}, but a correlation alias "
+                                "must resolve to a single field per source rule."
                             )
                         alias.mapping[rule_reference] = mapped_field_name[0]
 

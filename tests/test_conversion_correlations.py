@@ -1,7 +1,11 @@
 import pytest
 from sigma.backends.test import TextQueryTestBackend
 from sigma.collection import SigmaCollection
-from sigma.exceptions import SigmaBackendError, SigmaConversionError
+from sigma.exceptions import (
+    SigmaBackendError,
+    SigmaConversionError,
+    SigmaCorrelationFieldError,
+)
 from sigma.processing.pipeline import ProcessingPipeline, QueryPostprocessingItem
 from sigma.processing.postprocessing import EmbedQueryTransformation
 from .test_conversion_base import test_backend
@@ -138,6 +142,7 @@ detection:
 fields:
     - SubjectUserName
     - TargetUserName
+    - TargetDomainName
 ---
 title: Successful logon
 name: successful_logon
@@ -152,6 +157,7 @@ detection:
 fields:
     - SubjectUserName
     - TargetUserName
+    - TargetDomainName
     - LogonType
 ---
 title: Failed and successful logons for a single user
@@ -391,6 +397,8 @@ detection:
             - 528
             - 4624
     condition: selection
+fields:
+    - User
 ---
 title: Single failed login
 name: failed_login
@@ -403,6 +411,8 @@ detection:
             - 529
             - 4625
     condition: selection
+fields:
+    - User
 ---
 title: Multiple failed logons
 name: multiple_failed_login
@@ -456,6 +466,8 @@ detection:
             - 528
             - 4624
     condition: selection
+fields:
+    - User
 ---
 title: Single failed login
 name: failed_login
@@ -468,6 +480,8 @@ detection:
             - 529
             - 4625
     condition: selection
+fields:
+    - User
 ---
 title: Multiple failed logons
 name: multiple_failed_login
@@ -545,9 +559,11 @@ def test_correlation_normalization_not_supported(
         test_backend, "correlation_search_field_normalization_expression_joiner", None
     )
     with pytest.raises(
-        NotImplementedError, match="Correlation field normalization is not supported"
-    ):
+        SigmaCorrelationFieldError,
+        match="backend does not support correlation field normalization expressions",
+    ) as exc_info:
         test_backend.convert(temporal_ordered_correlation_rule)
+    assert exc_info.value.field == "user"
 
 
 def test_correlation_query_postprocessing(event_count_correlation_rule):
@@ -1004,6 +1020,9 @@ detection:
     selection:
         EventID: 4625
     condition: selection
+fields:
+    - TargetUserName
+    - TargetDomainName
 ---
 title: Successful logon
 name: successful_logon
@@ -1015,6 +1034,9 @@ detection:
     selection:
         EventID: 4624
     condition: selection
+fields:
+    - TargetUserName
+    - TargetDomainName
 ---
 title: Failed then successful logon
 status: test
@@ -1053,6 +1075,8 @@ detection:
     selection:
         EventID: 1
     condition: selection
+fields:
+    - User
 ---
 title: Rule two
 name: 'bad"name2'
@@ -1064,6 +1088,8 @@ detection:
     selection:
         EventID: 2
     condition: selection
+fields:
+    - User
 ---
 title: Temporal correlation with typing
 status: test
@@ -1105,6 +1131,8 @@ detection:
     selection:
         EventID: 1
     condition: selection
+fields:
+    - User
 ---
 title: Rule two
 name: '{second_name}'
@@ -1116,6 +1144,8 @@ detection:
     selection:
         EventID: 2
     condition: selection
+fields:
+    - User
 ---
 title: Temporal correlation
 status: test
@@ -1260,3 +1290,191 @@ correlation:
 
     # Verify no results were returned (both rule and correlation skipped)
     assert len(result) == 0
+
+
+# Two log sources name the user entity differently. They only describe the same entity because the
+# correlation rule declares an explicit alias; identical usernames on different hosts must stay in
+# separate correlation groups.
+def _two_host_user_correlation_yaml(*, with_alias: bool, group_by_user_name: bool = False):
+    alias_block = ""
+    if with_alias:
+        alias_block = """    aliases:
+        user:
+            host_a_logon: user.name
+            host_b_logon: subject
+"""
+    group_key = "user.name" if group_by_user_name else "user"
+    return f"""
+title: Host A logon
+name: host_a_logon
+status: test
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4624
+    condition: selection
+fields:
+    - host.name
+    - user.name
+---
+title: Host B logon
+name: host_b_logon
+status: test
+logsource:
+    product: linux
+    service: auth
+detection:
+    selection:
+        EventID: 4624
+    condition: selection
+fields:
+    - host.name
+    - subject
+---
+title: Logons of the same user entity across hosts
+status: test
+correlation:
+    type: event_count
+    rules:
+        - host_a_logon
+        - host_b_logon
+    timespan: 5m
+{alias_block}    group-by:
+        - {group_key}
+    condition:
+        gte: 2
+"""
+
+
+def test_correlation_explicit_alias_keeps_same_named_users_on_different_hosts_separated(test_backend):
+    """The explicit alias normalizes both source fields into one key and groups per host as well."""
+    rule_collection = SigmaCollection.from_yaml(
+        _two_host_user_correlation_yaml(with_alias=True).replace(
+            "    group-by:\n        - user\n",
+            "    group-by:\n        - host.name\n        - user\n",
+        )
+    )
+    result = test_backend.convert(rule_collection)
+    query = result[0]
+    # Each source normalizes its own user field name into the shared alias ...
+    assert 'subsearch { EventID=4624 | set event_type="host_a_logon" | set user=' in query
+    assert "set user='user.name'" in query
+    assert "set user=subject" in query
+    # ... while host.name keeps same-named users on different hosts in separate groups and the
+    # aggregation uses the alias instead of a source-specific field name.
+    assert " by 'host.name', user" in query
+    assert "by user.name" not in query
+
+
+def test_correlation_plain_groupby_field_missing_in_source_rule_is_rejected(test_backend):
+    """A plain group-by field that doesn't exist in a source rule must fail instead of broad grouping."""
+    rule_collection = SigmaCollection.from_yaml(
+        _two_host_user_correlation_yaml(with_alias=False, group_by_user_name=True)
+    )
+    with pytest.raises(SigmaCorrelationFieldError) as exc_info:
+        test_backend.convert(rule_collection)
+    error = exc_info.value
+    assert error.field == "user.name"
+    assert error.source_rule == "host_b_logon"
+    assert "correlation field alias" in str(error)
+
+
+def test_correlation_missing_alias_mapping_for_source_rule_is_rejected(test_backend):
+    """Removing one source rule's alias mapping makes the correlation key unrepresentable."""
+    yaml_with_incomplete_alias = """
+title: Host A logon
+name: host_a_logon
+status: test
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4624
+    condition: selection
+fields:
+    - user.name
+---
+title: Host B logon
+name: host_b_logon
+status: test
+logsource:
+    product: linux
+    service: auth
+detection:
+    selection:
+        EventID: 4624
+    condition: selection
+fields:
+    - subject
+---
+title: Logons with an incomplete alias
+status: test
+correlation:
+    type: event_count
+    rules:
+        - host_a_logon
+        - host_b_logon
+    timespan: 5m
+    aliases:
+        user:
+            host_a_logon: user.name
+    group-by:
+        - user
+    condition:
+        gte: 2
+"""
+    rule_collection = SigmaCollection.from_yaml(yaml_with_incomplete_alias)
+    with pytest.raises(SigmaCorrelationFieldError) as exc_info:
+        test_backend.convert(rule_collection)
+    error = exc_info.value
+    assert error.field == "user"
+    assert error.source_rule == "host_b_logon"
+    assert "has no field mapping" in str(error)
+
+
+def test_correlation_alias_rejected_when_backend_lacks_normalization_support(
+    monkeypatch, test_backend
+):
+    """Backends unable to emit field normalization can't represent an alias at all."""
+    rule_collection = SigmaCollection.from_yaml(
+        _two_host_user_correlation_yaml(with_alias=True)
+    )
+    monkeypatch.setattr(test_backend, "correlation_search_field_normalization_expression", None)
+    monkeypatch.setattr(
+        test_backend, "correlation_search_field_normalization_expression_joiner", None
+    )
+    with pytest.raises(SigmaCorrelationFieldError) as exc_info:
+        test_backend.convert(rule_collection)
+    assert exc_info.value.field == "user"
+    assert "does not support correlation field normalization" in str(exc_info.value)
+
+
+def test_correlation_alias_mapping_to_multiple_fields_is_rejected_with_context():
+    """A pipeline mapping one source field to several fields yields a contextual configuration error."""
+    from sigma.processing.pipeline import ProcessingItem, ProcessingPipeline
+    from sigma.processing.transformations import FieldMappingTransformation
+    from sigma.exceptions import SigmaConfigurationError
+
+    rule_collection = SigmaCollection.from_yaml(
+        _two_host_user_correlation_yaml(with_alias=True)
+    )
+    pipeline = ProcessingPipeline(
+        [
+            ProcessingItem(
+                FieldMappingTransformation(
+                    {"user.name": ["user.name.windows", "user.name.upn"], "subject": "sub"}
+                )
+            )
+        ]
+    )
+    backend = TextQueryTestBackend(processing_pipeline=pipeline)
+    with pytest.raises(SigmaConfigurationError) as exc_info:
+        backend.convert(rule_collection)
+    message = str(exc_info.value)
+    assert "testalias" not in message  # generic placeholder must not leak from unrelated paths
+    assert "user" in message
+    assert "host_a_logon" in message
+    assert "user.name" in message

@@ -253,6 +253,41 @@ class SigmaRuleNotFoundError(SigmaCorrelationRuleError):
     pass
 
 
+class SigmaCorrelationFieldError(SigmaConversionError):
+    """
+    A group-by field or field alias of a correlation rule can't be resolved into a usable
+    correlation key for every referenced source rule after the processing pipeline was applied.
+
+    In addition to the correlation rule and the source location it carries the offending group-by
+    key and the name of the source rule that causes the failure so that error messages point at the
+    concrete rule and correlation key instead of producing a broad query that silently groups over
+    unrelated events.
+    """
+
+    def __init__(
+        self,
+        rule: "SigmaRuleBase",
+        source: SigmaRuleLocation | None,
+        message: str,
+        field: str | None = None,
+        source_rule: str | None = None,
+    ) -> None:
+        self.field = field
+        self.source_rule = source_rule
+        super().__init__(rule, source, message)
+
+    def __str__(self) -> str:
+        context = super().__str__()
+        details = []
+        if self.field is not None:
+            details.append(f"correlation key '{self.field}'")
+        if self.source_rule is not None:
+            details.append(f"source rule '{self.source_rule}'")
+        if details:
+            context += " (" + ", ".join(details) + ")"
+        return context
+
+
 # Meta Filter Error
 
 

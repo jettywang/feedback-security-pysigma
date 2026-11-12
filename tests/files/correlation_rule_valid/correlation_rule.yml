@@ -93,5 +93,5 @@ correlation:
             base_rule_1: fieldC
             base_rule_2: fieldD
     group-by:
-        - fieldC
+        - field
     timespan: 15m

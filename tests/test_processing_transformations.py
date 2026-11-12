@@ -375,7 +375,13 @@ def test_field_mapping_correlation_rule_multiple_alias_mappings(
         SigmaRuleReference("testrule_1"),
         "field3",
     )
-    with pytest.raises(SigmaConfigurationError, match="rule alias mapping.*multiple field names"):
+    with pytest.raises(
+        SigmaConfigurationError,
+        match=(
+            "correlation rule alias mapping of correlation key 'testalias' for source rule "
+            "'testrule_1'.*multiple fields"
+        ),
+    ):
         field_mapping_transformation.set_pipeline(dummy_pipeline)
         field_mapping_transformation.apply(sigma_correlation_rule)
 

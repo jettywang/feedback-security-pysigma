@@ -286,7 +286,7 @@ def test_filter_sigma_collection_from_ruleset(sigma_filter, test_backend):
         'subsearch { mappedA="value3" and mappedB="value4" | set '
         'event_type="base_rule_2" | set field=fieldD }\n'
         "\n"
-        "| temporal window=15min eventtypes=base_rule_1,base_rule_2 by fieldC\n"
+        "| temporal window=15min eventtypes=base_rule_1,base_rule_2 by field\n"
         "\n"
         "| where eventtype_count >= 2",
     ]
