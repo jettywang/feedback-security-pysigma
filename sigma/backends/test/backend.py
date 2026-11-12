@@ -4,6 +4,7 @@ from typing import Any, ClassVar, cast
 
 from sigma.conversion.base import TextQueryBackend
 from sigma.conversion.state import ConversionState
+from sigma.correlations import SigmaCorrelationWindowMode
 from sigma.pipelines.test import dummy_test_pipeline
 from sigma.processing.pipeline import ProcessingItem, ProcessingPipeline
 from sigma.processing.transformations import FieldMappingTransformation
@@ -117,6 +118,12 @@ class TextQueryTestBackend(TextQueryBackend):
         "test": "Test correlation method",
     }
     default_correlation_method: ClassVar[str] = "test"
+    # The test backend emits seconds or mapped units and supports a sliding window, matching the
+    # reference correlation matcher semantics. Declaring capabilities opts into timespan checks.
+    correlation_timespan_min_unit: ClassVar[str] = "s"
+    correlation_window_modes: ClassVar[frozenset[SigmaCorrelationWindowMode]] = frozenset(
+        {SigmaCorrelationWindowMode.SLIDING}
+    )
     default_correlation_query: ClassVar[dict[str, str]] = {
         "test": "{search}\n{aggregate}\n{condition}"
     }
@@ -282,3 +289,13 @@ class TextQueryTestBackend(TextQueryBackend):
 
 class MandatoryPipelineTestBackend(TextQueryTestBackend):
     requires_pipeline: ClassVar[bool] = True
+
+
+class FixedWindowTestBackend(TextQueryTestBackend):
+    """Backend that only supports fixed, aligned time buckets with minute granularity."""
+
+    name: ClassVar[str] = "Fixed window test backend"
+    correlation_timespan_min_unit: ClassVar[str] = "m"
+    correlation_window_modes: ClassVar[frozenset[SigmaCorrelationWindowMode]] = frozenset(
+        {SigmaCorrelationWindowMode.FIXED}
+    )

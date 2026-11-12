@@ -1260,3 +1260,377 @@ correlation:
 
     # Verify no results were returned (both rule and correlation skipped)
     assert len(result) == 0
+
+
+# Correlation timespan capability tests
+from datetime import datetime, timedelta, timezone
+
+from sigma.backends.test import FixedWindowTestBackend
+from sigma.correlations import (
+    SIGMA_TIMESPAN_APPROXIMATION_MARKER,
+    SigmaCorrelationTimespan,
+    SigmaCorrelationTimespanCapability,
+    SigmaCorrelationWindowMode,
+)
+from sigma.conversion.base import SigmaCorrelationConversionResult
+from sigma.exceptions import SigmaCorrelationTimespanNotSupportedError, SigmaValueError
+from sigma.matching import Event, EventLogSource, SigmaMatcher
+
+
+def _correlation_timespan_rule(timespan: str) -> SigmaCollection:
+    return SigmaCollection.from_yaml(f"""
+title: Failed logon
+name: failed_logon
+status: test
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4625
+    condition: selection
+---
+title: Multiple failed logons
+status: test
+correlation:
+    type: event_count
+    rules:
+        - failed_logon
+    group-by:
+        - TargetUserName
+    timespan: {timespan}
+    condition:
+        gte: 2
+            """)
+
+
+class TestCorrelationTimespanCapabilityDeclaration:
+    def test_declared_capability_is_exposed(self, test_backend):
+        capability = test_backend.get_correlation_timespan_capability()
+        assert capability.declared
+        assert capability.min_unit == "s"
+        assert capability.supports_sliding
+        assert not capability.supports_fixed
+
+    def test_undeclared_capability_used_for_legacy_backends(self):
+        backend = TextQueryTestBackend()
+        backend.correlation_timespan_min_unit = None
+        backend.correlation_window_modes = None
+        capability = backend.get_correlation_timespan_capability()
+        assert not capability.declared
+        assert capability.window_modes == frozenset()
+
+    @pytest.mark.parametrize("min_unit", ["ms", "min", "S", ""])
+    def test_invalid_min_unit_rejected(self, min_unit):
+        with pytest.raises(SigmaValueError, match="Invalid correlation timespan minimum unit"):
+            SigmaCorrelationTimespanCapability(min_unit=min_unit)
+
+    def test_invalid_window_mode_rejected(self):
+        with pytest.raises(SigmaValueError, match="Invalid correlation window mode"):
+            SigmaCorrelationTimespanCapability(window_modes=frozenset({"rolling"}))
+
+    def test_capability_without_correlation_support_rejected(self):
+        backend = TextQueryTestBackend()
+        backend.correlation_methods = None
+        backend.correlation_window_modes = frozenset({SigmaCorrelationWindowMode.SLIDING})
+        with pytest.raises(SigmaBackendError, match="does not support correlation rules"):
+            backend._validate_correlation_timespan_capability()
+
+
+class TestCorrelationTimespanExactness:
+    def test_exact_sliding_window_is_accepted(self, test_backend):
+        rules = _correlation_timespan_rule("5m")
+        assert test_backend.convert(rules) == ["""EventID=4625
+| aggregate window=5min count() as event_count by TargetUserName
+| where event_count >= 2"""]
+        resolution = rules[1].get_conversion_states()[0].metadata["correlation_timespan"]
+        assert resolution["exact"] is True
+        assert resolution["window_mode"] == "sliding"
+        assert resolution["effective_spec"] == "5m"
+        assert resolution["deviation_seconds"] == 0
+        assert resolution["marker"] is None
+
+    def test_fixed_window_backend_rejected_by_default(self):
+        with pytest.raises(
+            SigmaCorrelationTimespanNotSupportedError,
+            match="fixed time buckets instead of a sliding window",
+        ):
+            FixedWindowTestBackend().convert(_correlation_timespan_rule("5m"))
+
+    def test_fixed_window_rejection_returns_no_query(self):
+        with pytest.raises(SigmaCorrelationTimespanNotSupportedError) as exc_info:
+            FixedWindowTestBackend().convert(_correlation_timespan_rule("5m"))
+        assert "cannot be represented exactly" in str(exc_info.value)
+
+    def test_coarse_granularity_rejected_by_default(self, monkeypatch, test_backend):
+        monkeypatch.setattr(test_backend, "correlation_timespan_min_unit", "m")
+        with pytest.raises(
+            SigmaCorrelationTimespanNotSupportedError,
+            match="rounded up from 30s to 1m",
+        ):
+            test_backend.convert(_correlation_timespan_rule("30s"))
+
+    def test_approximation_disabled_by_default(self, test_backend):
+        assert test_backend.allow_correlation_timespan_approximation is False
+
+    def test_explicit_approximation_marks_fixed_window_result(self):
+        backend = FixedWindowTestBackend()
+        backend.allow_correlation_timespan_approximation = True
+        result = backend.convert(_correlation_timespan_rule("5m"))
+        assert isinstance(result, SigmaCorrelationConversionResult)
+        assert SIGMA_TIMESPAN_APPROXIMATION_MARKER in result.markers
+        assert result.approximated
+        assert result[0] == """EventID=4625
+| aggregate window=5min count() as event_count by TargetUserName
+| where event_count >= 2"""
+        metadata = result.get_metadata()
+        assert metadata["markers"] == [SIGMA_TIMESPAN_APPROXIMATION_MARKER]
+        assert metadata["timespans"][0]["exact"] is False
+        assert metadata["timespans"][0]["precision_exact"] is True
+        assert metadata["timespans"][0]["semantics_exact"] is False
+        assert "fixed time buckets" in metadata["notices"][0]
+
+    def test_approximation_widens_and_marks_instead_of_simply_replacing_unit(
+        self, monkeypatch, test_backend
+    ):
+        monkeypatch.setattr(test_backend, "correlation_timespan_min_unit", "m")
+        monkeypatch.setattr(test_backend, "allow_correlation_timespan_approximation", True)
+        result = test_backend.convert(_correlation_timespan_rule("30s"))
+        assert isinstance(result, SigmaCorrelationConversionResult)
+        assert SIGMA_TIMESPAN_APPROXIMATION_MARKER in result.markers
+        # A naive unit replacement would emit 30s. The effective window must be the rounded-up
+        # 1m duration so that it is never narrower than the requested window.
+        assert "window=1min" in result[0]
+        resolution = result.get_metadata()["timespans"][0]
+        assert resolution["requested"] == "30s"
+        assert resolution["effective_spec"] == "1m"
+        assert resolution["effective_seconds"] == 60
+        assert resolution["deviation_seconds"] == 30
+        assert resolution["approximated"] is True
+        assert resolution["marker"] == SIGMA_TIMESPAN_APPROXIMATION_MARKER
+
+    def test_approximation_in_seconds_mode_uses_effective_seconds(self, monkeypatch, test_backend):
+        monkeypatch.setattr(test_backend, "correlation_timespan_min_unit", "m")
+        monkeypatch.setattr(test_backend, "allow_correlation_timespan_approximation", True)
+        monkeypatch.setattr(test_backend, "timespan_seconds", True)
+        result = test_backend.convert(_correlation_timespan_rule("90s"))
+        assert "window=120" in result[0]
+        assert result.get_metadata()["timespans"][0]["effective_seconds"] == 120
+
+    def test_exact_granularity_multiple_is_not_marked(self, monkeypatch, test_backend):
+        monkeypatch.setattr(test_backend, "correlation_timespan_min_unit", "m")
+        rules = _correlation_timespan_rule("2m")
+        result = test_backend.convert(rules)
+        assert not isinstance(result, SigmaCorrelationConversionResult)
+        resolution = rules[1].get_conversion_states()[0].metadata["correlation_timespan"]
+        assert resolution["exact"] is True
+        assert resolution["effective_spec"] == "2m"
+
+    def test_explicitly_unsupported_window_mode_rejected(self, test_backend):
+        with pytest.raises(
+            SigmaValueError, match="does not support correlation window mode 'fixed'"
+        ):
+            test_backend.resolve_correlation_timespan(
+                SigmaCorrelationTimespan("5m"), SigmaCorrelationWindowMode.FIXED
+            )
+
+
+class TestCorrelationWindowBoundaryAgainstReference:
+    @staticmethod
+    def _rule_yaml(timespan: str = "5m") -> str:
+        return f"""
+title: Base Rule
+name: base_rule
+status: test
+logsource:
+    category: test
+    product: test
+detection:
+    selection:
+        field: "trigger"
+    condition: selection
+---
+title: Correlation
+name: correlation_rule
+status: test
+correlation:
+    type: event_count
+    rules:
+        - base_rule
+    group-by:
+        - user
+    timespan: {timespan}
+    condition:
+        gte: 2
+"""
+
+    def _events(self, base: datetime, offsets: list[int], user: str) -> list[Event]:
+        ls = EventLogSource(category="test", product="test")
+        return [
+            Event(
+                timestamp=base + timedelta(seconds=offset),
+                logsource=ls,
+                data={"field": "trigger", "user": user},
+            )
+            for offset in offsets
+        ]
+
+    def test_reference_window_includes_exact_boundary(self):
+        # The reference matcher evicts entries strictly older than now - timespan. An event
+        # exactly at the boundary therefore remains inside the window.
+        collection = SigmaCollection.from_yaml(self._rule_yaml())
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with SigmaMatcher(collection) as matcher:
+            matches = matcher.bulk_match(self._events(base, [0, 300], "edge"))
+            assert any(m.rule.name == "correlation_rule" for m in matches)
+
+    def test_reference_window_excludes_event_beyond_boundary(self):
+        collection = SigmaCollection.from_yaml(self._rule_yaml())
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with SigmaMatcher(collection) as matcher:
+            matches = matcher.bulk_match(self._events(base, [0, 301], "outside"))
+            assert not any(m.rule.name == "correlation_rule" for m in matches)
+
+    def test_exact_mode_agrees_with_reference_criterion_near_boundary(self, test_backend):
+        collection = SigmaCollection.from_yaml(self._rule_yaml())
+        result = test_backend.convert(collection)
+        resolution = collection[1].get_conversion_states()[0].metadata["correlation_timespan"]
+        assert resolution["exact"] is True
+        assert resolution["window_mode"] == "sliding"
+        assert resolution["effective_spec"] == "5m"
+        assert test_backend.resolve_correlation_timespan(SigmaCorrelationTimespan("5m")).exact
+
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        ls = EventLogSource(category="test", product="test")
+
+        def triggers(offsets: list[int], user: str) -> bool:
+            with SigmaMatcher(SigmaCollection.from_yaml(self._rule_yaml())) as matcher:
+                return any(
+                    m.rule.name == "correlation_rule"
+                    for m in matcher.bulk_match(self._events(base, offsets, user))
+                )
+
+        assert triggers([0, 300], "boundary")
+        assert not triggers([0, 301], "beyond")
+
+    def test_cross_bucket_pair_is_inside_reference_sliding_window(self):
+        # Two events 2 seconds apart, but straddling a fixed 1-minute bucket boundary.
+        collection = SigmaCollection.from_yaml(self._rule_yaml("2m"))
+        base = datetime(2026, 1, 1, 0, 0, 59, tzinfo=timezone.utc)
+        with SigmaMatcher(collection) as matcher:
+            matches = matcher.bulk_match(self._events(base, [0, 2], "alice"))
+            assert any(m.rule.name == "correlation_rule" for m in matches)
+        assert base.minute != (base + timedelta(seconds=2)).minute
+        assert base.replace(second=0) != (base + timedelta(seconds=2)).replace(second=0)
+
+    def test_cross_bucket_pair_is_not_silently_accepted_by_fixed_backend(self):
+        # A fixed-bucket backend would separate these events into adjacent buckets, but they are
+        # inside the requested sliding window. It must not emit a successful-looking query
+        # without a marker.
+        with pytest.raises(SigmaCorrelationTimespanNotSupportedError, match="fixed time buckets"):
+            FixedWindowTestBackend().convert(_correlation_timespan_rule("2m"))
+
+    def test_cross_bucket_pair_is_marked_when_approximation_allowed(self):
+        backend = FixedWindowTestBackend()
+        backend.allow_correlation_timespan_approximation = True
+        result = backend.convert(_correlation_timespan_rule("2m"))
+        assert SIGMA_TIMESPAN_APPROXIMATION_MARKER in result.markers
+        metadata = result.get_metadata()["timespans"][0]
+        assert metadata["semantics_exact"] is False
+        assert metadata["window_mode"] == "fixed"
+        assert metadata["approximated"] is True
+
+
+class TestCorrelationTimespanEdgeCases:
+    def test_legacy_backend_is_not_checked_or_marked(self, monkeypatch, test_backend):
+        monkeypatch.setattr(test_backend, "correlation_timespan_min_unit", None)
+        monkeypatch.setattr(test_backend, "correlation_window_modes", None)
+        rules = _correlation_timespan_rule("30s")
+        result = test_backend.convert(rules)
+        assert not isinstance(result, SigmaCorrelationConversionResult)
+        resolution = rules[1].get_conversion_states()[0].metadata["correlation_timespan"]
+        assert resolution["verified"] is False
+        assert resolution["exact"] is True
+
+    def test_collect_errors_keeps_rejection_as_error(self):
+        backend = FixedWindowTestBackend(collect_errors=True)
+        result = backend.convert(_correlation_timespan_rule("5m"))
+        assert result == []
+        assert len(backend.errors) == 1
+        error = backend.errors[0][1]
+        assert isinstance(error, SigmaCorrelationTimespanNotSupportedError)
+        assert "cannot be represented exactly" in str(error)
+
+    def test_mixed_collection_retains_marker_for_approximated_rule(self):
+        backend = FixedWindowTestBackend()
+        backend.allow_correlation_timespan_approximation = True
+        rules = SigmaCollection.from_yaml("""
+title: Exact duration rule
+name: exact_rule
+status: test
+logsource:
+    product: windows
+detection:
+    selection:
+        EventID: 1
+    condition: selection
+---
+title: Approximated correlation
+status: test
+correlation:
+    type: event_count
+    rules:
+        - exact_rule
+    timespan: 2m
+    condition:
+        gte: 2
+---
+title: Another detection
+name: another_rule
+status: test
+logsource:
+    product: windows
+detection:
+    selection:
+        EventID: 2
+    condition: selection
+""")
+        result = backend.convert(rules)
+        # The plain detection rule is not a correlation rule and must not add a marker itself.
+        assert isinstance(result, SigmaCorrelationConversionResult)
+        assert result.get_metadata()["markers"] == [SIGMA_TIMESPAN_APPROXIMATION_MARKER]
+        assert len(result.get_metadata()["timespans"]) == 1
+        assert result == backend.finalize(
+            [
+                result[0],
+                result[1],
+            ],
+            "default",
+        )
+
+    def test_resolution_helper_reports_exact_capability(self, test_backend):
+        resolution = test_backend.resolve_correlation_timespan(SigmaCorrelationTimespan("1h"))
+        assert resolution.exact
+        assert resolution.verified
+        assert resolution.semantics_exact
+        assert resolution.precision_exact
+        assert resolution.window_mode == SigmaCorrelationWindowMode.SLIDING
+
+    def test_fixed_window_resolution_reports_deviation_but_not_precision(self):
+        resolution = FixedWindowTestBackend().resolve_correlation_timespan(
+            SigmaCorrelationTimespan("5m")
+        )
+        assert not resolution.exact
+        assert resolution.precision_exact
+        assert not resolution.semantics_exact
+        assert resolution.deviation_seconds == 0
+        assert resolution.marker == SIGMA_TIMESPAN_APPROXIMATION_MARKER
+        assert resolution.window_mode == SigmaCorrelationWindowMode.FIXED
+
+    def test_result_marker_and_metadata_are_directly_accessible(self):
+        backend = FixedWindowTestBackend()
+        backend.allow_correlation_timespan_approximation = True
+        result = backend.convert(_correlation_timespan_rule("5m"))
+        assert SIGMA_TIMESPAN_APPROXIMATION_MARKER in result
+        assert result.metadata["markers"] == [SIGMA_TIMESPAN_APPROXIMATION_MARKER]
+        assert result.metadata == result.get_metadata()

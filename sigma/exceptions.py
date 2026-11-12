@@ -247,6 +247,12 @@ class SigmaTimespanError(SigmaCorrelationRuleError):
     pass
 
 
+class SigmaCorrelationTimespanNotSupportedError(SigmaConversionError, SigmaTimespanError):
+    """Raised when a backend cannot exactly represent a correlation rule timespan."""
+
+    pass
+
+
 class SigmaRuleNotFoundError(SigmaCorrelationRuleError):
     """Sigma rule not found."""
 

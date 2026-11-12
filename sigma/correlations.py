@@ -396,6 +396,175 @@ class SigmaCorrelationTimespan:
         self.seconds = self.count * self.unit_seconds[self.unit]
 
 
+class SigmaCorrelationWindowMode(EnumLowercaseStringMixin, Enum):
+    """
+    Time window semantics that a backend can express for correlation rules.
+
+    * SLIDING: every new event is evaluated against all events of the same group within the
+      preceding timespan. This is the reference semantics used by
+      :class:`~sigma.matching.SigmaCorrelationRuleMatcher` and by the Sigma correlation rule
+      specification.
+    * FIXED: events are evaluated in fixed, pre-aligned time buckets. A fixed bucket is not
+      equivalent to a sliding window: two events within the requested timespan but in adjacent
+      buckets are not correlated.
+    """
+
+    SLIDING = auto()
+    FIXED = auto()
+
+
+# Marker retained on approximated correlation conversions. Consumers can use it to ensure that a
+# query is not treated as an exact implementation of the Sigma correlation semantics.
+SIGMA_TIMESPAN_APPROXIMATION_MARKER = "timespan-approximated"
+
+
+@dataclass(frozen=True)
+class SigmaCorrelationTimespanCapability:
+    """
+    Declares how a backend can represent correlation rule timespans.
+
+    Attributes:
+        min_unit: Smallest timespan unit the backend can represent. Must be one of the units
+            supported by :class:`SigmaCorrelationTimespan` (``s``, ``m``, ``h``, ``d``, ``w``,
+            ``M`` or ``y``). ``None`` means the backend did not restrict the minimum unit.
+        window_modes: Time window semantics the backend can express. An empty set means the
+            backend did not declare a mode. A backend capable of both semantics should declare
+            both; conversion prefers SLIDING because that matches the Sigma reference semantics.
+        declared: Whether the backend actually declared capability information. If False, the
+            backend follows the legacy behavior and no timespan checks are enforced.
+    """
+
+    min_unit: str | None = None
+    window_modes: frozenset[SigmaCorrelationWindowMode] = field(default_factory=frozenset)
+    declared: bool = True
+
+    def __post_init__(self: Self) -> None:
+        if self.min_unit is not None and self.min_unit not in SigmaCorrelationTimespan.unit_seconds:
+            raise sigma_exceptions.SigmaValueError(
+                f"Invalid correlation timespan minimum unit '{self.min_unit}', must be one of: "
+                + ", ".join(SigmaCorrelationTimespan.unit_seconds)
+            )
+
+        coerced_modes: set[SigmaCorrelationWindowMode] = set()
+        for mode in self.window_modes:
+            if isinstance(mode, SigmaCorrelationWindowMode):
+                coerced_modes.add(mode)
+            elif isinstance(mode, str):
+                try:
+                    coerced_modes.add(SigmaCorrelationWindowMode[mode.upper()])
+                except KeyError:
+                    raise sigma_exceptions.SigmaValueError(
+                        f"Invalid correlation window mode '{mode}', must be one of: sliding, fixed"
+                    )
+            else:
+                raise sigma_exceptions.SigmaValueError(f"Invalid correlation window mode {mode!r}")
+        object.__setattr__(self, "window_modes", frozenset(coerced_modes))
+
+    @classmethod
+    def undeclared(cls: type[Self]) -> Self:
+        """Create a capability object for backends that do not declare timespan support."""
+        return cls(min_unit=None, window_modes=frozenset(), declared=False)
+
+    @property
+    def min_unit_seconds(self: Self) -> int | None:
+        """Return the minimum representable unit in seconds or None if unrestricted."""
+        if self.min_unit is None:
+            return None
+        return SigmaCorrelationTimespan.unit_seconds[self.min_unit]
+
+    @property
+    def supports_sliding(self: Self) -> bool:
+        return SigmaCorrelationWindowMode.SLIDING in self.window_modes
+
+    @property
+    def supports_fixed(self: Self) -> bool:
+        return SigmaCorrelationWindowMode.FIXED in self.window_modes
+
+    def supports_duration(self: Self, seconds: int) -> bool:
+        """Return True if the duration can be represented exactly with the minimum unit."""
+        if self.min_unit_seconds is None:
+            return True
+        return seconds > 0 and seconds % self.min_unit_seconds == 0
+
+    def to_dict(self: Self) -> dict[str, Any]:
+        return {
+            "min_unit": self.min_unit,
+            "window_modes": sorted(str(mode) for mode in self.window_modes),
+            "declared": self.declared,
+        }
+
+
+@dataclass(frozen=True)
+class SigmaCorrelationTimespanResolution:
+    """
+    Result of checking a correlation rule timespan against backend capabilities.
+
+    Attributes:
+        requested: The timespan requested by the rule.
+        capability: The capability declaration against which the timespan was checked.
+        window_mode: The window mode selected for conversion. ``None`` if the backend did not
+            declare one.
+        effective_seconds: The window width the generated query actually implements.
+        effective_count: Count of the effective timespan in :attr:`effective_unit`.
+        effective_unit: Unit in which the effective timespan should be represented.
+        exact: True only if the backend can represent both the duration and the sliding-window
+            semantics exactly.
+        verified: True if the backend declared capabilities and the check was actually performed.
+            False means the backend is legacy and the timespan was accepted without verification.
+        precision_exact: True if the effective duration equals the requested duration.
+        semantics_exact: True if the backend's window mode matches the sliding-window reference
+            semantics.
+        deviation_seconds: Effective duration minus requested duration. Positive values mean the
+            generated query uses a wider window than requested.
+        explanation: Human-readable explanation of a non-exact representation, or None for an
+            exact representation.
+        marker: Retention marker for approximations. ``None`` for exact representations.
+    """
+
+    requested: SigmaCorrelationTimespan
+    capability: SigmaCorrelationTimespanCapability
+    window_mode: SigmaCorrelationWindowMode | None
+    effective_seconds: int
+    effective_count: int
+    effective_unit: str
+    exact: bool
+    precision_exact: bool
+    semantics_exact: bool
+    deviation_seconds: int
+    explanation: str | None = None
+    marker: str | None = None
+    verified: bool = True
+
+    @property
+    def approximated(self: Self) -> bool:
+        """Return True if the backend cannot represent the requested semantics exactly."""
+        return not self.exact
+
+    @property
+    def effective_spec(self: Self) -> str:
+        """Return the effective timespan in Sigma notation."""
+        return f"{self.effective_count}{self.effective_unit}"
+
+    def to_dict(self: Self) -> dict[str, Any]:
+        """Return a serializable representation suitable for conversion state metadata."""
+        return {
+            "requested": self.requested.spec,
+            "requested_seconds": self.requested.seconds,
+            "min_unit": self.capability.min_unit,
+            "window_mode": str(self.window_mode) if self.window_mode is not None else None,
+            "effective_spec": self.effective_spec,
+            "effective_seconds": self.effective_seconds,
+            "exact": self.exact,
+            "verified": self.verified,
+            "precision_exact": self.precision_exact,
+            "semantics_exact": self.semantics_exact,
+            "approximated": self.approximated,
+            "deviation_seconds": self.deviation_seconds,
+            "explanation": self.explanation,
+            "marker": self.marker,
+        }
+
+
 @dataclass
 class SigmaCorrelationFieldAlias:
     """

@@ -20,6 +20,14 @@ TextQueryBackend
    :undoc-members:
    :show-inheritance:
 
+SigmaCorrelationConversionResult
+--------------------------------
+
+.. autoclass:: sigma.conversion.base.SigmaCorrelationConversionResult
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 ConversionState
 ---------------
 

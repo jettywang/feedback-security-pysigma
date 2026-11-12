@@ -29,14 +29,19 @@ from sigma.correlations import (
     SigmaCorrelationFieldAliases,
     SigmaCorrelationRule,
     SigmaCorrelationTimespan,
+    SigmaCorrelationTimespanCapability,
+    SigmaCorrelationTimespanResolution,
     SigmaCorrelationType,
     SigmaCorrelationTypeLiteral,
+    SigmaCorrelationWindowMode,
     SigmaExtendedCorrelationCondition,
     SigmaRuleReference,
+    SIGMA_TIMESPAN_APPROXIMATION_MARKER,
 )
 from sigma.exceptions import (
     SigmaBackendError,
     SigmaConversionError,
+    SigmaCorrelationTimespanNotSupportedError,
     SigmaError,
     SigmaFeatureNotSupportedByBackendError,
     SigmaValueError,
@@ -63,6 +68,89 @@ from sigma.types import (
     SpecialChars,
     TimestampPart,
 )
+
+
+class SigmaCorrelationConversionResult:
+    """
+    Conversion result wrapper for approximated correlation conversions.
+
+    Backends return arbitrary query representations (strings, lists, dicts, objects). Wrapping
+    those would break existing callers, therefore the original conversion output is exposed
+    unchanged through the sequence, equality, string, mapping and iteration protocols. The
+    approximation marker and deviation explanation are available via metadata.
+
+    Attributes:
+        queries: The original conversion output returned by finalize.
+        timespan_resolutions: Capability check results for all converted correlation rules.
+        markers: Retention markers that apply to this result. Contains
+            SIGMA_TIMESPAN_APPROXIMATION_MARKER when at least one timespan was approximated.
+        approximated: True if any correlation timespan was approximated.
+        notices: Human-readable explanations of all deviations.
+    """
+
+    def __init__(
+        self,
+        queries: Any,
+        timespan_resolutions: list[SigmaCorrelationTimespanResolution],
+    ) -> None:
+        object.__setattr__(self, "queries", queries)
+        object.__setattr__(self, "timespan_resolutions", timespan_resolutions)
+        self.approximated = any(not resolution.exact for resolution in timespan_resolutions)
+        self.markers: frozenset[str] = (
+            frozenset({SIGMA_TIMESPAN_APPROXIMATION_MARKER}) if self.approximated else frozenset()
+        )
+        self.notices = tuple(
+            resolution.explanation
+            for resolution in timespan_resolutions
+            if not resolution.exact and resolution.explanation is not None
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, SigmaCorrelationConversionResult):
+            return self.queries == other.queries and self.markers == other.markers
+        return bool(self.queries == other)
+
+    def __str__(self) -> str:
+        return str(self.queries)
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(queries={self.queries!r}, " f"markers={sorted(self.markers)!r})"
+        )
+
+    def __len__(self) -> int:
+        return len(self.queries)
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.queries)
+
+    def __getitem__(self, index: Any) -> Any:
+        return self.queries[index]
+
+    def __contains__(self, item: Any) -> bool:
+        """Check queries and markers so the approximation marker can be tested directly."""
+        return item in self.markers or item in self.queries
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate everything else (e.g. mapping lookups) to the original output. Guard private
+        # attributes to avoid recursion during unpickling or partial initialization.
+        if name.startswith("_") or name in {"queries", "timespan_resolutions"}:
+            raise AttributeError(name)
+        return getattr(self.queries, name)
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        """Return serializable metadata describing markers and deviations."""
+        return self.get_metadata()
+
+    def get_metadata(self) -> dict[str, Any]:
+        """Return serializable metadata describing markers and deviations."""
+        return {
+            "markers": sorted(self.markers),
+            "approximated": self.approximated,
+            "notices": list(self.notices),
+            "timespans": [resolution.to_dict() for resolution in self.timespan_resolutions],
+        }
 
 
 class Backend(ABC):
@@ -129,6 +217,24 @@ class Backend(ABC):
     # The following class variable defines the default method that should be chosen if none is provided.
     default_correlation_method: ClassVar[str] = "default"
 
+    # Backends declare which correlation timespans and window semantics they can represent.
+    # min_unit is the smallest unit the backend can express (s, m, h, d, w, M or y). window_modes
+    # lists the supported semantics: SLIDING (reference semantics) and/or FIXED (aligned buckets).
+    # Leave both unset (None) for legacy backends that do not declare capabilities; timespan checks
+    # are then not enforced to preserve backward compatibility. Declare them to opt in to
+    # timespan validation.
+    correlation_timespan_min_unit: ClassVar[str | None] = None
+    correlation_window_modes: ClassVar[
+        frozenset[SigmaCorrelationWindowMode] | set[SigmaCorrelationWindowMode] | None
+    ] = None
+    # If True, a timespan that cannot be represented exactly is converted with a wider, aligned
+    # window and marked as approximated instead of failing. If False (default), such rules are
+    # rejected before a query is generated.
+    allow_correlation_timespan_approximation: ClassVar[bool] = False
+    # Key under which the timespan resolution is stored in the conversion state and, for
+    # approximated conversions, in the conversion result metadata.
+    correlation_timespan_state_key: ClassVar[str] = "correlation_timespan"
+
     processing_pipeline: ProcessingPipeline | None
     last_processing_pipeline: ProcessingPipeline
     backend_processing_pipeline: ClassVar[ProcessingPipeline] = ProcessingPipeline()
@@ -137,7 +243,7 @@ class Backend(ABC):
     )
     default_format: ClassVar[str] = "default"
     collect_errors: bool = False
-    errors: list[tuple[SigmaRule, SigmaError]]
+    errors: list[tuple[SigmaRule | SigmaCorrelationRule, SigmaError]]
 
     # Perform finalization on all queries used in a correl
     finalize_correlation_subqueries = False
@@ -173,6 +279,237 @@ class Backend(ABC):
         self.errors = []
         self.collect_errors: bool = collect_errors
         self.backend_options: dict[str, dict[str, Any]] = backend_options
+        self._correlation_timespan_resolutions: dict[int, SigmaCorrelationTimespanResolution] = {}
+        self._validate_correlation_timespan_capability()
+
+    def _validate_correlation_timespan_capability(self) -> None:
+        """Validate the correlation timespan capability declaration at backend instantiation."""
+        if (
+            self.correlation_window_modes is not None
+            or self.correlation_timespan_min_unit is not None
+        ) and self.correlation_methods is None:
+            raise SigmaBackendError(
+                "Backend declares correlation timespan capabilities but does not support "
+                "correlation rules (correlation_methods is not defined)."
+            )
+        # Constructing the capability validates units and converts mode strings to enums early.
+        self.get_correlation_timespan_capability()
+
+    def get_correlation_timespan_capability(self) -> SigmaCorrelationTimespanCapability:
+        """
+        Return the backend's declared correlation timespan capability.
+
+        Backends that do not define correlation_timespan_min_unit or correlation_window_modes
+        return an undeclared capability. In that legacy case timespan checks are skipped to
+        preserve backward compatibility. Newly implemented backends should set at least
+        correlation_window_modes to opt in to validation.
+        """
+        if self.correlation_window_modes is None and self.correlation_timespan_min_unit is None:
+            return SigmaCorrelationTimespanCapability.undeclared()
+        return SigmaCorrelationTimespanCapability(
+            min_unit=self.correlation_timespan_min_unit,
+            window_modes=frozenset(self.correlation_window_modes or frozenset()),
+            declared=True,
+        )
+
+    @staticmethod
+    def _correlation_timespan_round_up(seconds: int, granularity_seconds: int) -> int:
+        """
+        Round a duration up to the next multiple of granularity_seconds.
+
+        Rounding up is deliberate: a generated window must never be narrower than the requested
+        one, because that would weaken the detection condition without the caller noticing.
+        """
+        if granularity_seconds <= 0:
+            raise SigmaValueError("Correlation timespan granularity must be greater than zero.")
+        if seconds <= 0:
+            raise SigmaValueError("Correlation timespan must be greater than zero.")
+        quotient, remainder = divmod(seconds, granularity_seconds)
+        return (quotient + (1 if remainder else 0)) * granularity_seconds
+
+    @staticmethod
+    def _correlation_timespan_to_spec(seconds: int, preferred_unit: str) -> tuple[int, str]:
+        """
+        Express a duration in the coarsest possible unit.
+
+        Preferring the coarsest unit mirrors the requested timespan's unit when possible
+        (``30m`` stays ``30m``) and otherwise keeps the output compact (``60s`` becomes ``1m``).
+        """
+        unit_seconds = SigmaCorrelationTimespan.unit_seconds
+        if seconds % unit_seconds[preferred_unit] == 0:
+            count = seconds // unit_seconds[preferred_unit]
+            # Use the requested unit only if it is at least as coarse as any other exact unit.
+            coarser = [
+                unit
+                for unit, factor in unit_seconds.items()
+                if factor > unit_seconds[preferred_unit] and seconds % factor == 0
+            ]
+            if not coarser:
+                return count, preferred_unit
+            preferred_unit = max(coarser, key=lambda unit: unit_seconds[unit])
+        for unit, factor in sorted(unit_seconds.items(), key=lambda item: item[1], reverse=True):
+            if seconds % factor == 0:
+                return seconds // factor, unit
+        return seconds, "s"
+
+    def resolve_correlation_timespan(
+        self,
+        timespan: SigmaCorrelationTimespan,
+        window_mode: SigmaCorrelationWindowMode | str | None = None,
+    ) -> SigmaCorrelationTimespanResolution:
+        """
+        Check whether the backend can represent a correlation rule timespan exactly.
+
+        The result distinguishes duration precision from window semantics. A fixed time bucket
+        backend can represent the same duration but not the sliding-window semantics, so it is
+        still non-exact. Durations that cannot be expressed with the backend's minimum unit are
+        rounded up to the next representable duration; they are never rounded down.
+
+        Args:
+            timespan: The timespan requested by the correlation rule.
+            window_mode: Optional explicit window mode. If omitted, sliding semantics are selected
+                when supported, otherwise fixed semantics. If the backend did not declare any
+                window mode, fixed semantics are assumed for approximation purposes.
+
+        Raises:
+            SigmaValueError: If an explicitly requested window mode is not supported.
+        """
+        capability = self.get_correlation_timespan_capability()
+        if not capability.declared:
+            return SigmaCorrelationTimespanResolution(
+                requested=timespan,
+                capability=capability,
+                window_mode=None,
+                effective_seconds=timespan.seconds,
+                effective_count=timespan.count,
+                effective_unit=timespan.unit,
+                exact=True,
+                precision_exact=True,
+                semantics_exact=True,
+                deviation_seconds=0,
+                explanation=None,
+                marker=None,
+                verified=False,
+            )
+
+        requested_mode: SigmaCorrelationWindowMode | None
+        if window_mode is not None:
+            if isinstance(window_mode, SigmaCorrelationWindowMode):
+                requested_mode = window_mode
+            else:
+                try:
+                    requested_mode = SigmaCorrelationWindowMode[str(window_mode).upper()]
+                except KeyError:
+                    raise SigmaValueError(
+                        f"Invalid correlation window mode '{window_mode}', must be one of: "
+                        + ", ".join(str(mode) for mode in SigmaCorrelationWindowMode)
+                    )
+            if requested_mode not in capability.window_modes:
+                raise SigmaValueError(
+                    f"Backend '{self.name}' does not support correlation window mode "
+                    f"'{requested_mode}'."
+                )
+        elif capability.supports_sliding:
+            requested_mode = SigmaCorrelationWindowMode.SLIDING
+        elif capability.supports_fixed:
+            requested_mode = SigmaCorrelationWindowMode.FIXED
+        else:
+            requested_mode = SigmaCorrelationWindowMode.FIXED
+
+        granularity = capability.min_unit_seconds or 1
+        effective_seconds = self._correlation_timespan_round_up(timespan.seconds, granularity)
+        precision_exact = capability.supports_duration(timespan.seconds)
+        if precision_exact:
+            # Keep the requested representation when no rounding is needed.
+            effective_count, effective_unit = timespan.count, timespan.unit
+        else:
+            effective_count, effective_unit = self._correlation_timespan_to_spec(
+                effective_seconds, timespan.unit
+            )
+        semantics_exact = requested_mode == SigmaCorrelationWindowMode.SLIDING
+        exact = precision_exact and semantics_exact
+        deviation_seconds = effective_seconds - timespan.seconds
+
+        explanations: list[str] = []
+        if not precision_exact:
+            explanations.append(
+                f"Requested timespan {timespan.spec} ({timespan.seconds}s) cannot be represented "
+                f"exactly with a minimum unit of '{capability.min_unit}'; it was rounded up from "
+                f"{timespan.spec} to {effective_count}{effective_unit} ({effective_seconds}s), "
+                f"an increase of {deviation_seconds}s."
+            )
+        if not semantics_exact:
+            explanations.append(
+                f"The backend uses fixed time buckets instead of a sliding window. Two events "
+                f"that are within the requested {timespan.spec} window but fall into adjacent "
+                f"buckets may not be correlated; the effective bucket width is "
+                f"{effective_count}{effective_unit}."
+            )
+        if capability.window_modes == frozenset():
+            explanations.append(
+                "The backend declared a minimum unit but no window semantics; fixed time buckets "
+                "were assumed for this approximation."
+            )
+
+        return SigmaCorrelationTimespanResolution(
+            requested=timespan,
+            capability=capability,
+            window_mode=requested_mode,
+            effective_seconds=effective_seconds,
+            effective_count=effective_count,
+            effective_unit=effective_unit,
+            exact=exact,
+            precision_exact=precision_exact,
+            semantics_exact=semantics_exact,
+            deviation_seconds=deviation_seconds,
+            explanation=" ".join(explanations) if explanations else None,
+            marker=None if exact else SIGMA_TIMESPAN_APPROXIMATION_MARKER,
+        )
+
+    def check_correlation_timespan(
+        self,
+        timespan: SigmaCorrelationTimespan,
+        rule: SigmaCorrelationRule | None = None,
+        window_mode: SigmaCorrelationWindowMode | str | None = None,
+    ) -> SigmaCorrelationTimespanResolution:
+        """
+        Resolve a timespan and reject it unless it can be represented exactly or explicit
+        approximation is enabled.
+
+        Raises:
+            SigmaCorrelationTimespanNotSupportedError: If the timespan cannot be represented
+                exactly and allow_correlation_timespan_approximation is False.
+        """
+        resolution = self.resolve_correlation_timespan(timespan, window_mode)
+        if not resolution.exact and not self.allow_correlation_timespan_approximation:
+            message = (
+                f"Correlation timespan {timespan.spec} cannot be represented exactly by "
+                f"backend '{self.name}'. {resolution.explanation or ''} "
+                "Set allow_correlation_timespan_approximation = True on the backend to "
+                "convert with an explicit approximation marker."
+            ).strip()
+            raise SigmaCorrelationTimespanNotSupportedError(
+                cast(SigmaCorrelationRule, rule),
+                rule.source if rule is not None else None,
+                message,
+            )
+        return resolution
+
+    def _store_correlation_timespan_resolution(
+        self, rule: SigmaCorrelationRule, resolution: SigmaCorrelationTimespanResolution
+    ) -> None:
+        """Keep the resolution for the current correlation rule conversion."""
+        self._correlation_timespan_resolutions[id(rule)] = resolution
+
+    def _get_correlation_timespan_resolution(
+        self, rule: SigmaCorrelationRule
+    ) -> SigmaCorrelationTimespanResolution:
+        """Return the current rule's resolution, resolving it if conversion was invoked directly."""
+        resolution = self._correlation_timespan_resolutions.get(id(rule))
+        if resolution is None:
+            resolution = self.check_correlation_timespan(rule.timespan, rule)
+            self._store_correlation_timespan_resolution(rule, resolution)
+        return resolution
 
     def init_processing_pipeline(self, output_format: str | None = None) -> None:
         """
@@ -218,8 +555,11 @@ class Backend(ABC):
         """
         self.init_processing_pipeline(output_format)
         rule_collection.resolve_rule_references()
-        queries = [
-            query
+        correlation_resolutions = self._correlation_timespan_resolutions
+        # Do not reuse decisions from previous conversions in the same backend instance.
+        correlation_resolutions.clear()
+        converted_rules = [
+            (rule, query)
             for rule in rule_collection.rules
             for query in (
                 self.convert_rule(rule, output_format or self.default_format, callback)
@@ -229,7 +569,19 @@ class Backend(ABC):
                 )
             )
         ]
-        return self.finalize(queries, output_format or self.default_format)
+        queries = [query for _, query in converted_rules]
+        output = self.finalize(queries, output_format or self.default_format)
+
+        # Preserve capability decisions and approximation markers on the conversion result. Only
+        # wrap approximated conversions to keep exact outputs backward compatible.
+        timespan_resolutions = [
+            correlation_resolutions[id(rule)]
+            for rule in rule_collection.rules
+            if isinstance(rule, SigmaCorrelationRule) and id(rule) in correlation_resolutions
+        ]
+        if any(not resolution.exact for resolution in timespan_resolutions):
+            return SigmaCorrelationConversionResult(output, timespan_resolutions)
+        return output
 
     def convert_rule(
         self,
@@ -695,7 +1047,30 @@ class Backend(ABC):
                 rule.source,
                 f"Correlation method '{method}' is not supported by backend '{self.name}'.",
             )
+        try:
+            return self._convert_correlation_rule(rule, output_format, method, callback)
+        except SigmaError as e:
+            if self.collect_errors:
+                self.errors.append((rule, e))
+                return []
+            raise
+
+    def _convert_correlation_rule(
+        self,
+        rule: SigmaCorrelationRule,
+        output_format: str | None,
+        method: str,
+        callback: (
+            Callable[[SigmaRule | SigmaCorrelationRule, str | None, int, Any, Any], Any] | None
+        ) = None,
+    ) -> list[Any]:
+        """Convert a correlation rule after method and capability checks."""
         self.last_processing_pipeline.apply(rule)
+
+        # Check the requested timespan against the backend's declared capabilities before any
+        # query is generated. This prevents silently widening the detection window.
+        timespan_resolution = self.check_correlation_timespan(rule.timespan, rule)
+        self._store_correlation_timespan_resolution(rule, timespan_resolution)
 
         # Determine which conversion method to use based on type and condition type
         from sigma.correlations import SigmaExtendedCorrelationCondition
@@ -738,7 +1113,12 @@ class Backend(ABC):
         raw_queries = correlation_methods[rule.type](rule, output_format, method)
 
         states = [
-            ConversionState(processing_state=dict(self.last_processing_pipeline.state))
+            ConversionState(
+                processing_state=dict(self.last_processing_pipeline.state),
+                metadata={
+                    self.correlation_timespan_state_key: timespan_resolution.to_dict(),
+                },
+            )
             for _ in raw_queries
         ]
 
@@ -2393,11 +2773,12 @@ class TextQueryBackend(Backend):
             )
 
         search = self.convert_correlation_search(rule)
+        timespan_resolution = self._get_correlation_timespan_resolution(rule)
         return [
             template[method].format(
                 search=search,
                 typing=self.convert_correlation_typing(rule),
-                timespan=self.convert_timespan(rule.timespan, method),
+                timespan=self.convert_correlation_timespan(timespan_resolution, method),
                 aggregate=self.convert_correlation_aggregation_from_template(
                     rule, correlation_type, method, search
                 ),
@@ -2688,7 +3069,7 @@ class TextQueryBackend(Backend):
             fields=self.convert_correlation_aggregation_fields_from_template(
                 rule.fields, rule.referenced_rules, rule.group_by, method
             ),
-            timespan=self.convert_timespan(rule.timespan, method),
+            timespan=self.convert_correlation_timespan_for_rule(rule, method),
             groupby=self.convert_correlation_aggregation_groupby_from_template(
                 rule.group_by, method
             ),
@@ -2955,6 +3336,39 @@ class TextQueryBackend(Backend):
         else:
             ruleid = cond.reference
         return template.format(ruleid=ruleid)
+
+    def convert_correlation_timespan_for_rule(
+        self,
+        rule: SigmaCorrelationRule,
+        method: str | None = None,
+    ) -> str:
+        """
+        Convert the timespan of a correlation rule after applying the capability check.
+
+        This is used by the standard template-based aggregation expressions. Backends overriding
+        the aggregation phase should call this method instead of convert_timespan to make sure
+        the resolved, effective timespan is emitted.
+        """
+        return self.convert_correlation_timespan(
+            self._get_correlation_timespan_resolution(rule), method
+        )
+
+    def convert_correlation_timespan(
+        self,
+        resolution: SigmaCorrelationTimespanResolution,
+        method: str | None = None,
+    ) -> str:
+        """
+        Convert a resolved correlation timespan into the target format.
+
+        Exact resolutions are passed to convert_timespan like regular timespans. Approximated
+        resolutions use the effective, widened timespan instead of the requested one.
+        """
+        timespan = resolution.requested
+        if resolution.exact:
+            return self.convert_timespan(timespan, None, method)
+        effective_timespan = SigmaCorrelationTimespan(resolution.effective_spec)
+        return self.convert_timespan(effective_timespan, None, method)
 
     def convert_timespan(
         self,

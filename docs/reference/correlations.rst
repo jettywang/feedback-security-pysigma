@@ -73,3 +73,29 @@ Supporting Classes
    :members:
    :undoc-members:
    :show-inheritance:
+
+Timespan Capabilities
+---------------------
+
+Correlation rules assume a sliding time window: every new event is evaluated against all events
+of the same group within the preceding timespan. Backends can only implement this faithfully if
+their target system supports the required granularity and window semantics. Backends declare
+this with ``correlation_timespan_min_unit`` and ``correlation_window_modes`` on the backend class.
+
+.. autoclass:: sigma.correlations.SigmaCorrelationWindowMode
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. autoclass:: sigma.correlations.SigmaCorrelationTimespanCapability
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. autoclass:: sigma.correlations.SigmaCorrelationTimespanResolution
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. autodata:: sigma.correlations.SIGMA_TIMESPAN_APPROXIMATION_MARKER
+

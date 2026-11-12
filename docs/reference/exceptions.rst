@@ -111,6 +111,9 @@ Correlation Exceptions
 .. autoclass:: sigma.exceptions.SigmaTimespanError
    :show-inheritance:
 
+.. autoclass:: sigma.exceptions.SigmaCorrelationTimespanNotSupportedError
+   :show-inheritance:
+
 Validator Exceptions
 --------------------
 

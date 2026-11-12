@@ -1,1 +1,1 @@
-from .backend import TextQueryTestBackend, MandatoryPipelineTestBackend
+from .backend import FixedWindowTestBackend, MandatoryPipelineTestBackend, TextQueryTestBackend

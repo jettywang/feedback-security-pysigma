@@ -239,6 +239,60 @@ statistical conditions. pySigma handles these through the same conversion interf
 The backend must support correlation rule conversion for this to work. Not all backends
 implement correlation support.
 
+Correlation timespan capabilities
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Correlation rules define a ``timespan``, and their reference semantics use a sliding window:
+each new event is evaluated together with all events of the same group within the preceding
+timespan. A backend must be able to represent both the duration and that window semantics
+exactly. Backends declare their abilities with two class variables:
+
+.. code-block:: python
+
+   from sigma.correlations import SigmaCorrelationWindowMode
+
+   class MyBackend(TextQueryBackend):
+       # Smallest unit that can be expressed by the target system (s, m, h, d, w, M or y).
+       correlation_timespan_min_unit = "m"
+       # Semantics the target system can express.
+       correlation_window_modes = frozenset({SigmaCorrelationWindowMode.SLIDING})
+
+If a rule's timespan cannot be represented exactly, conversion fails with
+:class:`~sigma.exceptions.SigmaCorrelationTimespanNotSupportedError` by default. This prevents
+a query from silently implementing a different detection strategy than requested, for example
+a fixed-bucket aggregation for a rule that requires a sliding window.
+
+A backend may explicitly allow approximations:
+
+.. code-block:: python
+
+   class MyFixedBucketBackend(TextQueryBackend):
+       correlation_timespan_min_unit = "m"
+       correlation_window_modes = frozenset({SigmaCorrelationWindowMode.FIXED})
+       allow_correlation_timespan_approximation = True
+
+In this mode the backend rounds durations up to the next representable duration (never down,
+because a narrower window would weaken the rule) and marks the conversion result. The output is
+wrapped in :class:`~sigma.conversion.base.SigmaCorrelationConversionResult`, which still behaves
+like the backend's regular output but exposes ``markers``, ``notices`` and
+``get_metadata()``. The marker ``SIGMA_TIMESPAN_APPROXIMATION_MARKER`` is also retained on the
+conversion state of each correlation rule together with the full resolution details.
+
+Callers can check a backend and a rule timespan without converting:
+
+.. code-block:: python
+
+   from sigma.correlations import SigmaCorrelationTimespan
+
+   resolution = backend.resolve_correlation_timespan(SigmaCorrelationTimespan("5m"))
+   resolution.exact            # both duration and window semantics match
+   resolution.window_mode      # SigmaCorrelationWindowMode.SLIDING or .FIXED
+   resolution.effective_spec   # duration the backend would actually use
+   resolution.deviation_seconds
+
+Backends that do not declare either class variable are treated as legacy backends and are not
+subject to timespan checks. Newly implemented backends should declare both.
+
 Complete Workflow Example
 -------------------------
 
