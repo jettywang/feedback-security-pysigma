@@ -11,6 +11,7 @@ Complete reference documentation for all pySigma modules, classes, and functions
    backends
    processing
    conditions
+   suppression
    transformations
    postprocessing
    validators

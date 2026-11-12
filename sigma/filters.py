@@ -13,6 +13,7 @@ from sigma import exceptions as sigma_exceptions
 from sigma.correlations import SigmaCorrelationRule, SigmaRuleReference
 from sigma.rule import SigmaDetection, SigmaDetections, SigmaLogSource, SigmaRule, SigmaRuleBase
 from sigma.rule.logsource import EmptyLogSource
+from sigma.suppression import RULES_ANY, SuppressionSource
 
 if TYPE_CHECKING:
     from sigma.exceptions import SigmaRuleLocation
@@ -207,37 +208,54 @@ class SigmaFilter(SigmaRuleBase):
 
         return d
 
-    def _should_apply_on_rule(self: Self, rule: SigmaRule | SigmaCorrelationRule) -> bool:
+    def _matched_rule_references(
+        self: Self, rule: SigmaRule | SigmaCorrelationRule
+    ) -> list[str] | str | None:
+        """Return the filter rule references that match *rule*.
+
+        Returns:
+            * :data:`sigma.suppression.RULES_ANY` when the filter applies to all
+              rules matching the logsource (``rules: any``),
+            * the list of concrete references (rule IDs or names) that resolve to
+              *rule*,
+            * ``None`` when the filter does not apply to *rule*.
+
+        Correlation rules are never filtered.
+        """
         from sigma.collection import SigmaCollection
 
         # Don't apply filters to correlation rules
         if isinstance(rule, SigmaCorrelationRule):
-            return False
+            return None
 
         # Check if logsource matches
         if rule.logsource not in self.logsource:
-            return False
+            return None
 
         # If rules is "any", apply to all rules matching the logsource
         if isinstance(self.filter.rules, str) and self.filter.rules.lower() == "any":
-            return True
+            return RULES_ANY
 
         # At this point, rules must be a list (not a string)
         assert isinstance(self.filter.rules, list)
 
         # For each rule ID/title in the filter.rules, add the rule to the reference using the resolve method,
         # then filter each reference to see if the rule is in the reference
-        matches = []
+        matches: list[str] = []
         for reference in self.filter.rules:
             try:
-                matches.append(SigmaCollection([rule])[reference.reference])
+                SigmaCollection([rule])[reference.reference]
             except sigma_exceptions.SigmaRuleNotFoundError:
-                pass
+                continue
+            matches.append(reference.reference)
 
         if not matches:
-            return False
+            return None
 
-        return True
+        return matches
+
+    def _should_apply_on_rule(self: Self, rule: SigmaRule | SigmaCorrelationRule) -> bool:
+        return self._matched_rule_references(rule) is not None
 
     # Keywords that must not be prefixed when rewriting filter conditions. They are compared
     # case-sensitively, like in the condition grammar in sigma.conditions, where e.g. "NOT" is
@@ -253,7 +271,8 @@ class SigmaFilter(SigmaRuleBase):
     def apply_on_rule(
         self: Self, rule: SigmaRule | SigmaCorrelationRule
     ) -> SigmaRule | SigmaCorrelationRule:
-        if not self._should_apply_on_rule(rule) or isinstance(rule, SigmaCorrelationRule):
+        matched_references = self._matched_rule_references(rule)
+        if matched_references is None or isinstance(rule, SigmaCorrelationRule):
             return rule
 
         # Generate one random prefix shared by all filter identifiers in this application.
@@ -262,11 +281,31 @@ class SigmaFilter(SigmaRuleBase):
         # filter condition (e.g. "1 of selection_*") continue to work after renaming.
         prefix = "_filt_" + "".join(random.choices(string.ascii_lowercase, k=10))
 
+        # Provenance follows the actual filter condition nodes: one source is recorded
+        # per filter application and attached to every copied filter detection, which lets
+        # the suppression module recover it from the leaves of the final condition tree.
+        # Filters that did not match never reach this point and therefore leave no source.
+        suppression_source = SuppressionSource(
+            filter_title=self.title,
+            filter_id=str(self.id) if self.id is not None else None,
+            filter_name=self.name,
+            matched_rules=matched_references,
+            filter_condition=self.filter.condition[0],
+            prefix=prefix,
+            filter_source=self.source,
+            rule_source=rule.source,
+            rule_title=rule.title,
+            rule_id=str(rule.id) if rule.id is not None else None,
+        )
+        rule.detection.suppression_sources[prefix] = suppression_source
+
         # Rename every filter detection identifier with the shared prefix. Each rule gets its own
         # copy of the filter detections: processing pipelines modify detections in place, so a
         # detection object shared between rules would be transformed again for every rule.
         for original_cond_name, condition in self.filter.detections.items():
-            rule.detection.detections[prefix + "_" + original_cond_name] = copy.deepcopy(condition)
+            copied_condition = copy.deepcopy(condition)
+            self._attach_suppression(copied_condition, suppression_source)
+            rule.detection.detections[prefix + "_" + original_cond_name] = copied_condition
 
         # Rewrite the filter condition string so that every identifier/pattern token is
         # prefixed.  This handles:
@@ -301,6 +340,16 @@ class SigmaFilter(SigmaRuleBase):
         rule.detection.__post_init__()
 
         return rule
+
+    @staticmethod
+    def _attach_suppression(
+        detection: SigmaDetection, suppression_source: SuppressionSource
+    ) -> None:
+        """Attach the suppression source to a copied filter detection and its nested copies."""
+        detection.suppression = suppression_source
+        for item in detection.detection_items:
+            if isinstance(item, SigmaDetection):
+                SigmaFilter._attach_suppression(item, suppression_source)
 
     @classmethod
     def from_yaml(

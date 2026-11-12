@@ -34,6 +34,7 @@ from sigma.types import SigmaNull, SigmaString, SigmaType, sigma_type
 if TYPE_CHECKING:
     from sigma.processing.pipeline import ProcessingItemBase
     from sigma.policy import SigmaPolicy
+    from sigma.suppression import SuppressionSource
 
 # Type alias for plain detection types
 # SigmaPlainValue = str | int | float | bool | None
@@ -298,6 +299,10 @@ class SigmaDetection(ParentChainMixin):
     detection_items: list[SigmaDetectionItem | SigmaDetection]
     source: SigmaRuleLocation | None = field(default=None, compare=False)
     item_linking: type[ConditionAND | ConditionOR] | None = field(default=None)
+    #: Provenance of the filter that added this detection.  Stays ``None`` for
+    #: detections defined by the rule itself, so filter provenance only appears
+    #: on condition nodes that a matched filter actually contributed.
+    suppression: "SuppressionSource | None" = field(default=None, compare=False, repr=False)
 
     def __post_init__(self: Self) -> None:
         """Check detection validity."""
@@ -519,6 +524,12 @@ class SigmaDetections:
     condition: list[str]
     source: SigmaRuleLocation | None = field(default=None, compare=False)
     policy: "SigmaPolicy | None" = field(default=None, compare=False)
+    #: Suppression sources of filters applied to the owning rule, keyed by the
+    #: generated ``_filt_...`` prefix of each filter application and kept in
+    #: application order.
+    suppression_sources: "dict[str, SuppressionSource]" = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     def __post_init__(self: Self) -> None:
         """Detections sanity checks"""

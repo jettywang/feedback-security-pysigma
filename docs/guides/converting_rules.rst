@@ -151,6 +151,39 @@ pipeline priorities when merging them:
    pipeline priorities. Use ``ProcessingPipelineResolver`` to ensure pipelines are merged in the
    correct order based on their priority values (lowest priority first).
 
+Tracing Filter Suppressions
+---------------------------
+
+Filters narrow down a detection by appending their condition (typically a
+``not ...`` expression) to the matched rule. To explain why an event was
+suppressed, the filter application records structured provenance that follows
+the condition nodes actually present in the final rule:
+
+.. code-block:: python
+
+   from sigma.collection import SigmaCollection
+   from sigma.filters import SigmaFilter
+   from sigma.suppression import suppression_provenance, suppression_trace
+
+   collection = SigmaCollection.from_yaml(rule_yaml)
+   collection.apply_filters([SigmaFilter.from_yaml(filter_yaml)])
+
+   rule = collection.rules[0]
+
+   # One entry per filter that matched the rule, in application order.
+   for source in suppression_provenance(rule):
+       print(source.filter_title, source.filter_condition, source.prefix)
+
+   # Node-level trace back to both the filter rule and the filtered rule,
+   # including the source file locations of both inputs.
+   trace = suppression_trace(rule)
+
+Only filters that matched the rule contribute a source; unmatched filters leave
+no trace, and the provenance covers nodes below ``NOT`` as well as stacked
+filters. A filter applied to several rules gets an independent source per rule,
+and the sources stay attached to the base rule when it is referenced by a
+correlation rule. See :mod:`sigma.suppression` for the full API reference.
+
 Output Formats
 --------------
 
