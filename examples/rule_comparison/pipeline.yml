@@ -1,0 +1,7 @@
+name: review-pipeline
+transformations:
+    - id: image-rename
+      type: field_name_mapping
+      mapping:
+          Image: ProcessName
+          ParentImage: ParentProcessName
