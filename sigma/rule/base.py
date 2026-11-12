@@ -141,6 +141,9 @@ class SigmaRuleBase:
     _backreferences: list[SigmaRuleBase] = field(
         init=False, default_factory=list, repr=False, compare=False
     )
+    _applied_filters: set[str] = field(
+        init=False, default_factory=set, repr=False, compare=False
+    )
     _conversion_result: list[Any] | None = field(
         init=False, default=None, repr=False, compare=False
     )
@@ -567,8 +570,18 @@ class SigmaRuleBase:
         return d
 
     def add_backreference(self: Self, rule: SigmaRuleBase) -> None:
-        """Add backreference to another rule."""
-        self._backreferences.append(rule)
+        """Add backreference to another rule. Adding the same rule twice is a no-op because
+        reference resolution can run repeatedly (e.g. on each backend conversion)."""
+        if rule not in self._backreferences:
+            self._backreferences.append(rule)
+
+    def is_filter_applied(self: Self, filter_key: str) -> bool:
+        """Check if a filter with the given tracking key was already applied to this rule."""
+        return filter_key in self._applied_filters
+
+    def mark_filter_applied(self: Self, filter_key: str) -> None:
+        """Record that a filter with the given tracking key was applied to this rule."""
+        self._applied_filters.add(filter_key)
 
     def referenced_by(self: Self, rule: SigmaRuleBase) -> bool:
         """Check if rule is referenced by another rule."""

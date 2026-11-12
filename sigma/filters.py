@@ -250,11 +250,32 @@ class SigmaFilter(SigmaRuleBase):
     # these characters, e.g. ``_filter`` or ``2nd_filter``.
     _CONDITION_TOKEN: ClassVar[re.Pattern[str]] = re.compile(r"[a-zA-Z0-9_*-]+")
 
+    def _tracking_key(self: Self) -> str:
+        """
+        Key used to track that this filter was already applied to a rule. Filters with an id are
+        tracked by it, so that separately parsed copies of the same filter (e.g. merged from
+        different collections) are also recognized as already applied. Filters without an id
+        fall back to object identity.
+        """
+        if self.id is not None:
+            return f"id:{self.id}"
+        return f"object:{id(self)}"
+
     def apply_on_rule(
         self: Self, rule: SigmaRule | SigmaCorrelationRule
     ) -> SigmaRule | SigmaCorrelationRule:
         if not self._should_apply_on_rule(rule) or isinstance(rule, SigmaCorrelationRule):
             return rule
+
+        # Filter application mutates the rule in place and is not idempotent by itself: each
+        # application wraps the rule conditions with another copy of the filter condition. Rules
+        # can pass through filter application multiple times (e.g. when an already filtered
+        # collection is merged into another collection), so skip rules this filter was already
+        # applied to.
+        tracking_key = self._tracking_key()
+        if rule.is_filter_applied(tracking_key):
+            return rule
+        rule.mark_filter_applied(tracking_key)
 
         # Generate one random prefix shared by all filter identifiers in this application.
         # Using a single prefix (rather than a fresh random name per identifier) preserves
