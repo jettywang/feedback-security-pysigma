@@ -26,6 +26,7 @@ from sigma.processing.conditions import (
     FieldNameProcessingItemAppliedCondition,
 )
 from sigma.processing.postprocessing import EmbedQueryTransformation
+from sigma.processing.transformations.failure import RuleFailureTransformation
 from sigma.processing.transformations import (
     SetStateTransformation,
     PreprocessingTransformation,
@@ -34,7 +35,12 @@ from sigma.processing.transformations import (
     FieldFunctionTransformation,
 )
 from sigma.rule import SigmaRule, SigmaDetectionItem
-from sigma.exceptions import SigmaConfigurationError, SigmaPipelineConditionError, SigmaTypeError
+from sigma.exceptions import (
+    SigmaConfigurationError,
+    SigmaPipelineConditionError,
+    SigmaTransformationError,
+    SigmaTypeError,
+)
 from sigma.types import SigmaString, SigmaFieldReference
 
 
@@ -1663,3 +1669,99 @@ def test_processingitem_set_pipeline_twice():
     item.set_pipeline(pipeline)
     with pytest.raises(SigmaProcessingItemError, match="Pipeline.*already set"):
         item.set_pipeline(pipeline)
+
+
+def test_processingpipeline_clone_is_independent():
+    pipeline = ProcessingPipeline(
+        items=[
+            ProcessingItem(TransformationPrepend(s="Pre"), identifier="pre"),
+            ProcessingItem(TransformationAppend(s="Append"), identifier="append"),
+        ],
+        vars={"a": 1},
+    )
+    clone = pipeline.clone()
+
+    sigma_rule = SigmaRule.from_yaml("""
+title: Test
+logsource:
+    category: test
+detection:
+    sel:
+        field: value
+    condition: sel
+""")
+    clone.apply(sigma_rule)
+    clone.state["key"] = "value"
+
+    assert clone.applied_ids == {"pre", "append"}
+    assert clone.state == {"key": "value"}
+    # The source pipeline and its item bindings were not touched.
+    assert pipeline.applied_ids == set()
+    assert pipeline.state == {}
+    assert clone is not pipeline
+    assert clone.items[0]._pipeline is clone
+    assert clone.items[0].transformation._pipeline is clone
+    assert pipeline.items[0]._pipeline is pipeline
+
+
+def test_processingpipeline_clone_tracking_preserves_field_mappings():
+    pipeline = ProcessingPipeline()
+    clone = pipeline.clone()
+    clone.track_field_processing_items("field1", ["fieldA"], "item")
+    assert clone.field_name_applied_ids == {"fieldA": {"item"}}
+    assert pipeline.field_name_applied_ids == {}
+
+
+def test_processingpipeline_reset_runtime_state_clears_everything():
+    pipeline = ProcessingPipeline()
+    pipeline.applied = [True]
+    pipeline.applied_ids = {"id"}
+    pipeline.field_name_applied_ids["field"] = {"id"}
+    pipeline.field_mappings.add_mapping("field", "mapped")
+    pipeline.state["key"] = "value"
+
+    pipeline.reset_runtime_state()
+
+    assert pipeline.applied == []
+    assert pipeline.applied_ids == set()
+    assert pipeline.field_name_applied_ids == {}
+    assert pipeline.field_mappings == {}
+    assert pipeline.state == {}
+
+
+def test_processingpipeline_apply_failure_leaks_no_state_to_next_rule():
+    pipeline = ProcessingPipeline(
+        items=[
+            ProcessingItem(TransformationPrepend(s="Pre"), identifier="pre"),
+            ProcessingItem(
+                RuleFailureTransformation("boom"),
+                rule_conditions=[LogsourceCondition(category="fail")],
+            ),
+        ]
+    )
+    failing_rule = SigmaRule.from_yaml("""
+title: Failing
+logsource:
+    category: fail
+detection:
+    sel:
+        field: value
+    condition: sel
+""")
+    with pytest.raises(SigmaTransformationError, match="boom"):
+        pipeline.apply(failing_rule)
+
+    second_rule = SigmaRule.from_yaml("""
+title: Second
+logsource:
+    category: ok
+detection:
+    sel:
+        field: value
+    condition: sel
+""")
+    pipeline.apply(second_rule)
+
+    # Only the second rule's items are reported; the failing rule's tracking and state are gone.
+    assert pipeline.applied == [True, False]
+    assert pipeline.applied_ids == {"pre"}

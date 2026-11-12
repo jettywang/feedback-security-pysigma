@@ -22,6 +22,18 @@ class ProcessingRegularExpressionMixin:
     _re: RegexPattern | None = field(init=False, default=None, repr=False, compare=False)
     _re_engine: RegexEngine | None = field(init=False, default=None, repr=False, compare=False)
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Drop cached compiled regex objects and rendered templates when cloning: they may
+        reference a regex engine module or Jinja2 internals and are rebuilt lazily on first use
+        by the clone. Classes combining this mixin with TemplateBase inherit this method, so it
+        covers both caches."""
+        state = self.__dict__.copy()
+        state["_re"] = None
+        state["_re_engine"] = None
+        state.pop("_j2template", None)
+        state.pop("j2template", None)
+        return state
+
     def resolve_regex_engine(self) -> RegexEngine:
         """Return the effective regex engine for this processing context."""
         from sigma.policy import default_policy

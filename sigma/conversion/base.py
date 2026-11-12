@@ -1,3 +1,4 @@
+import copy
 import re
 import string
 from abc import ABC, abstractmethod
@@ -177,11 +178,17 @@ class Backend(ABC):
     def init_processing_pipeline(self, output_format: str | None = None) -> None:
         """
         Initialize the processing pipeline by combining backend, processing, and output format pipelines.
+
+        The composed pipeline is rebuilt from the backend class pipeline and the user pipeline
+        passed to the constructor on every call. Each backend instance owns its own clone, so
+        runtime state (applied item tracking, field mappings, pipeline state) never leaks into
+        class-level pipelines or into the user's pipeline object. The user pipeline itself is
+        never modified.
         """
         self.last_processing_pipeline = (
-            self.backend_processing_pipeline
-            + self.processing_pipeline
-            + self.output_format_processing_pipeline[output_format or self.default_format]
+            self.backend_processing_pipeline.clone()
+            + (self.processing_pipeline.clone() if self.processing_pipeline is not None else None)
+            + self.output_format_processing_pipeline[output_format or self.default_format].clone()
         )
         self.last_processing_pipeline.vars.update(
             {"backend_" + key: value for key, value in self.backend_options.items()}
@@ -197,11 +204,19 @@ class Backend(ABC):
         callback: (
             Callable[[SigmaRule | SigmaCorrelationRule, str | None, int, Any, Any], Any] | None
         ) = None,
+        *,
+        inplace: bool = False,
     ) -> Any:
         """
         Convert a Sigma ruleset into the target data structure. Usually the result are one or
         multiple queries, but might also be some arbitrary data structure required for further
         processing.
+
+        By default the rules in *rule_collection* are not modified: each rule is processed on a
+        private copy belonging to this conversion call, so the same collection can be converted
+        again, also by another backend with another pipeline, and always starts from the original
+        detection. Correlation rules are processed as one consistent snapshot, including their
+        referenced rules.
 
         Args:
             rule_collection: Collection of Sigma rules to convert
@@ -212,24 +227,138 @@ class Backend(ABC):
                      returns a potentially modified result. The returned value replaces
                      the original conversion result. Return None to skip the result.
                      Called for every iteration, even when result is None.
+            inplace: Process the rule objects of the collection in place instead of on private
+                     copies. This is an explicit opt-in for callers that own the rules and want
+                     the processed detections (and conversion result/state) to remain on them.
+                     If a rule fails, its detections keep the modifications made before the
+                     failure and the next conversion starts from that partially processed state.
 
         Returns:
             Converted data structure (usually queries)
         """
         self.init_processing_pipeline(output_format)
         rule_collection.resolve_rule_references()
+        original_rules = list(rule_collection.rules)
+        rules, originals = self._rules_for_conversion(rule_collection, inplace)
         queries = [
             query
-            for rule in rule_collection.rules
+            for rule in rules
             for query in (
-                self.convert_rule(rule, output_format or self.default_format, callback)
+                self._convert_rule_for_collection(
+                    rule,
+                    output_format or self.default_format,
+                    callback,
+                    inplace=inplace,
+                    originals=originals,
+                )
                 if isinstance(rule, SigmaRule)
-                else self.convert_correlation_rule(
-                    rule, output_format or self.default_format, correlation_method, callback
+                else self._convert_correlation_rule_for_collection(
+                    rule,
+                    output_format or self.default_format,
+                    correlation_method,
+                    callback,
+                    inplace=inplace,
+                    originals=originals,
                 )
             )
         ]
         return self.finalize(queries, output_format or self.default_format)
+
+    def _rules_for_conversion(self, rule_collection: SigmaCollection, inplace: bool) -> tuple[
+        list[SigmaRule | SigmaCorrelationRule],
+        dict[int, SigmaRule | SigmaCorrelationRule],
+    ]:
+        """Return the rule objects to convert plus a mapping copy id -> original rule.
+
+        In default (non-inplace) mode this is one deep copy per rule of the collection. The copies
+        are created in a single deepcopy pass over the whole rule list, which keeps the graph
+        between correlation rules and their referenced rules consistent (references point to the
+        copied rules). Conversion results and states are then committed back to the original
+        rules after conversion (see _commit_rule_conversion_result).
+        """
+        if inplace:
+            return list(rule_collection.rules), {}
+        copied = copy.deepcopy(list(rule_collection.rules))
+        return copied, {
+            id(converted): original for original, converted in zip(rule_collection.rules, copied)
+        }
+
+    def _commit_rule_conversion_result(
+        self,
+        converted_rule: SigmaRule | SigmaCorrelationRule,
+        originals: dict[int, SigmaRule | SigmaCorrelationRule],
+    ) -> None:
+        """Commit conversion result and state from a processed copy to its original rule."""
+        original = originals.get(id(converted_rule))
+        if original is not None:
+            if converted_rule._conversion_result is not None:
+                original.set_conversion_result(converted_rule._conversion_result)
+            if converted_rule._conversion_states is not None:
+                original.set_conversion_states(converted_rule._conversion_states)
+
+    def _convert_rule_for_collection(
+        self,
+        rule: SigmaRule,
+        output_format: str | None = None,
+        callback: (
+            Callable[[SigmaRule | SigmaCorrelationRule, str | None, int, Any, Any], Any] | None
+        ) = None,
+        *,
+        inplace: bool,
+        originals: dict[int, SigmaRule | SigmaCorrelationRule],
+    ) -> list[Any]:
+        """Convert one rule of a collection; commits the result to the original afterwards."""
+        if inplace:
+            return self.convert_rule(rule, output_format, callback, inplace=True)
+        try:
+            result = self._convert_rule_internal(
+                rule,
+                output_format,
+                callback,
+                callback_rule=originals.get(id(rule), rule),
+            )
+        except SigmaError as e:
+            if self.collect_errors:
+                self.errors.append((originals.get(id(rule), rule), e))
+                return []
+            raise
+        self._commit_rule_conversion_result(rule, originals)
+        return result
+
+    def _convert_correlation_rule_for_collection(
+        self,
+        rule: SigmaCorrelationRule,
+        output_format: str | None = None,
+        method: str | None = None,
+        callback: (
+            Callable[[SigmaRule | SigmaCorrelationRule, str | None, int, Any, Any], Any] | None
+        ) = None,
+        *,
+        inplace: bool,
+        originals: dict[int, SigmaRule | SigmaCorrelationRule],
+    ) -> list[Any]:
+        """Convert one correlation rule of a collection; commits results to the originals."""
+        if inplace:
+            return self.convert_correlation_rule(
+                rule, output_format, method, callback, inplace=True
+            )
+        try:
+            result = self._convert_correlation_rule_internal(
+                rule,
+                output_format,
+                method,
+                callback,
+                callback_rule=originals.get(id(rule), rule),
+            )
+        except SigmaError as e:
+            if self.collect_errors:
+                self.errors.append((originals.get(id(rule), rule), e))
+                return []
+            raise
+        self._commit_rule_conversion_result(rule, originals)
+        for referenced in self._referenced_rule_objects(rule):
+            self._commit_rule_conversion_result(referenced, originals)
+        return result
 
     def convert_rule(
         self,
@@ -238,9 +367,17 @@ class Backend(ABC):
         callback: (
             Callable[[SigmaRule | SigmaCorrelationRule, str | None, int, Any, Any], Any] | None
         ) = None,
+        *,
+        inplace: bool = False,
     ) -> list[Any]:
         """
         Convert a single Sigma rule into the target data structure (usually query, see above).
+
+        By default *rule* is not modified: conversion runs on a private copy that this call owns.
+        The conversion result and conversion states are committed to *rule* afterwards so that
+        ``get_conversion_result()`` and ``get_conversion_states()`` on the passed rule keep
+        working. The processed detection (field mappings, value transformations, processing item
+        tracking) remains on the private copy only.
 
         Args:
             rule: The Sigma rule to convert
@@ -250,9 +387,52 @@ class Backend(ABC):
                      returns a potentially modified result. The returned value replaces
                      the original conversion result. Return None to skip the result.
                      Called for every iteration, even when result is None.
+            inplace: Process *rule* itself instead of a private copy. Explicit opt-in for callers
+                     that want the transformed detection to remain on the rule. In this mode a
+                     failed conversion leaves the modifications made before the failure on the
+                     rule, and the rule's processing item tracking is not reset before applying
+                     the pipeline.
 
         Returns:
             List of converted queries
+        """
+        working_rule, owns_copy = self._working_copy(rule, inplace)
+        try:
+            result = self._convert_rule_internal(
+                working_rule, output_format, callback, callback_rule=rule
+            )
+        except SigmaError as e:
+            if self.collect_errors:
+                self.errors.append((rule, e))
+                return []
+            raise
+        if owns_copy:
+            self._commit_rule_conversion_result(working_rule, {id(working_rule): rule})
+        return result
+
+    def _working_copy(
+        self, rule: SigmaRule | SigmaCorrelationRule, inplace: bool
+    ) -> tuple[SigmaRule | SigmaCorrelationRule, bool]:
+        """Return the rule object to process and whether it is a private copy."""
+        if inplace:
+            return rule, False
+        return copy.deepcopy(rule), True
+
+    def _convert_rule_internal(
+        self,
+        rule: SigmaRule,
+        output_format: str | None = None,
+        callback: (
+            Callable[[SigmaRule | SigmaCorrelationRule, str | None, int, Any, Any], Any] | None
+        ) = None,
+        *,
+        callback_rule: SigmaRule | None = None,
+    ) -> list[Any]:
+        """Convert a rule that is already owned by this conversion call.
+
+        *rule* is the object that is processed and receives conversion result and state.
+        *callback_rule* is the object passed to the callback (the caller's rule when conversion
+        runs on a copy), so callbacks can correlate their calls with the rule they passed in.
         """
         try:
             # Initialize processing pipeline if not already done
@@ -278,7 +458,13 @@ class Backend(ABC):
                 if result is not None:
                     result = self.finish_query(rule, result, state)
                 if callback is not None:
-                    result = callback(rule, output_format, index, cond, result)
+                    result = callback(
+                        callback_rule if callback_rule is not None else rule,
+                        output_format,
+                        index,
+                        cond,
+                        result,
+                    )
                 if result is not None:
                     queries.append(result)
 
@@ -304,15 +490,11 @@ class Backend(ABC):
                 return finalized_queries
             else:
                 return []
-        except SigmaError as e:
-            if self.collect_errors:
-                self.errors.append((rule, e))
-                return []
-            else:
-                raise e
         except (
             Exception
         ) as e:  # enrich all other exceptions with Sigma-specific context information
+            if isinstance(e, SigmaError):
+                raise
             msg = f" (while {error_state} rule {str(rule.source)})"
             if len(e.args) > 1:
                 e.args = (e.args[0] + msg,) + e.args[1:]
@@ -666,9 +848,18 @@ class Backend(ABC):
         callback: (
             Callable[[SigmaRule | SigmaCorrelationRule, str | None, int, Any, Any], Any] | None
         ) = None,
+        *,
+        inplace: bool = False,
     ) -> list[Any]:
         """
         Convert a correlation rule into the target data structure (usually query).
+
+        By default the correlation rule and the rules it references are converted on private
+        copies. The copies are made in a single deepcopy pass over the correlation rule, so the
+        references between the correlation rule and its subrules stay intact within the copied
+        graph and subrule conversion results (needed for the search phase) are available to the
+        correlation rule. Conversion results and states are committed to the original rules
+        afterwards.
 
         Args:
             rule (SigmaCorrelationRule): The correlation rule to be converted.
@@ -679,6 +870,8 @@ class Backend(ABC):
                      returns a potentially modified result. The returned value replaces
                      the original conversion result. Return None to skip the result.
                      Called for every iteration, even when result is None.
+            inplace: Process the correlation rule and its referenced rule objects themselves
+                     instead of private copies. Explicit opt-in, same semantics as convert().
 
         Returns:
             Any: The converted data structure.
@@ -686,6 +879,53 @@ class Backend(ABC):
         Raises:
             NotImplementedError: If the conversion for the given correlation rule type is not implemented.
         """
+        working_rule, owns_copy = self._working_copy(rule, inplace)
+        try:
+            result = self._convert_correlation_rule_internal(
+                working_rule, output_format, method, callback, callback_rule=rule
+            )
+        except SigmaError as e:
+            if self.collect_errors:
+                self.errors.append((rule, e))
+                return []
+            raise
+        if owns_copy:
+            originals: dict[int, SigmaRule | SigmaCorrelationRule] = {id(rule): rule}
+            for original_rule, copied_rule in zip(
+                self._referenced_rule_objects(rule), self._referenced_rule_objects(working_rule)
+            ):
+                originals[id(copied_rule)] = original_rule
+            self._commit_rule_conversion_result(working_rule, originals)
+            for copied_rule in self._referenced_rule_objects(working_rule):
+                self._commit_rule_conversion_result(copied_rule, originals)
+        return result
+
+    @staticmethod
+    def _referenced_rule_objects(
+        rule: SigmaCorrelationRule,
+    ) -> list[SigmaRule | SigmaCorrelationRule]:
+        """Return the referenced rule objects of a correlation rule in reference order."""
+        referenced = []
+        seen: set[int] = set()
+        for rule_reference in rule.referenced_rules:
+            referenced_rule = getattr(rule_reference, "rule", None)
+            if referenced_rule is not None and id(referenced_rule) not in seen:
+                seen.add(id(referenced_rule))
+                referenced.append(referenced_rule)
+        return referenced
+
+    def _convert_correlation_rule_internal(
+        self,
+        rule: SigmaCorrelationRule,
+        output_format: str | None = None,
+        method: str | None = None,
+        callback: (
+            Callable[[SigmaRule | SigmaCorrelationRule, str | None, int, Any, Any], Any] | None
+        ) = None,
+        *,
+        callback_rule: SigmaCorrelationRule | None = None,
+    ) -> list[Any]:
+        """Convert a correlation rule that is already owned by this conversion call."""
         if self.correlation_methods is None:
             raise NotImplementedError("Backend does not support correlation rules.")
         method = method or self.default_correlation_method
@@ -750,7 +990,13 @@ class Backend(ABC):
             if result is not None:
                 result = self.finish_query(rule, result, state)
             if callback is not None:
-                result = callback(rule, output_format, index, query, result)
+                result = callback(
+                    callback_rule if callback_rule is not None else rule,
+                    output_format,
+                    index,
+                    query,
+                    result,
+                )
             if result is not None:
                 queries.append(result)
 

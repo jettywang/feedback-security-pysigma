@@ -189,13 +189,62 @@ While ``convert`` operates on collections, you can also convert single rules:
 .. code-block:: python
 
    backend = TextQueryTestBackend()
-   backend.init_processing_pipeline()
    queries = backend.convert_rule(rule)
 
-.. note::
+``init_processing_pipeline()`` is also called automatically on the first ``convert_rule()``
+call if it was not initialized before.
 
-   You must call ``init_processing_pipeline()`` before converting individual rules outside
-   of the ``convert`` method.
+Rule Isolation and In-Place Mode
+--------------------------------
+
+By default, ``convert()``, ``convert_rule()`` and ``convert_correlation_rule()`` do not modify
+the passed rules or the rules of a passed collection. Each conversion runs on private copies
+owned by that conversion call. This means you can compile the same rule with different backends
+and pipelines without one conversion influencing the next one:
+
+.. code-block:: python
+
+   collection = SigmaCollection.from_yaml(rule_yaml)
+   backend_a = TextQueryTestBackend(pipeline_a)
+   backend_b = TextQueryTestBackend(pipeline_b)
+
+   queries_a = backend_a.convert(collection)  # uses the original detection
+   queries_b = backend_b.convert(collection)  # still uses the original detection
+
+   # Conversion results and states are committed to the original rules:
+   assert collection.rules[0].get_conversion_result() == queries_a
+
+The processed detections (field mappings, value transformations and processing item tracking)
+stay on the private copies and are never written back to the passed rules. Conversion results and
+conversion states are written back, because they are the output of a conversion and unrelated
+to processing state.
+
+If you explicitly want the processed detection to stay on the rule objects, pass
+``inplace=True``. The conversion result is identical, but the rule carries the pipeline's
+field/value changes and processing item tracking afterwards:
+
+.. code-block:: python
+
+   queries = backend.convert_rule(rule, inplace=True)
+   queries = backend.convert(collection, inplace=True)
+   queries = backend.convert_correlation_rule(correlation_rule, inplace=True)
+
+``inplace=True`` is an explicit opt-in for callers that own the rule objects and want to inspect
+the processed detection. In this mode, a conversion that fails halfway leaves the modifications
+made before the failure on the rule, and a subsequent conversion starts from that partially
+processed state. The default mode never leaves such modifications behind.
+
+Pipelines and their runtime state
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A ``ProcessingPipeline`` object is an immutable processing definition and can safely be shared,
+passed to multiple backends or converted repeatedly. Backends compose the pipeline from their
+class-level backend pipeline, the user pipeline and the output-format pipeline and clone each
+component, so a backend instance never writes applied item tracking, field mappings or pipeline
+state into the shared pipeline objects. ``ProcessingPipeline.apply()`` resets its runtime state
+at the start of each rule; this also guarantees that a failed rule cannot leak tracking or state
+into the next rule.
+
 
 Correlation Rules
 -----------------

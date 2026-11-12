@@ -3758,3 +3758,35 @@ def test_extract_fields_transformation_mixed_matches_preserve_true():
     assert isinstance(third, SigmaDetection)
     assert third.detection_items[0].field == "reg.type"
     assert third.detection_items[0].value == [SigmaString("Qword")]
+
+
+def test_non_idempotent_pipeline_applied_to_same_rule_by_two_backends():
+    """A prefix pipeline applied by backend A must not be applied again by backend B."""
+    rule = SigmaRule.from_yaml("""
+title: Test
+logsource:
+    category: test
+detection:
+    sel:
+        field: value
+    condition: sel
+""")
+    backend_a = TextQueryTestBackend(
+        ProcessingPipeline(
+            [
+                ProcessingItem(AddFieldnamePrefixTransformation("a."), identifier="prefix_a"),
+            ]
+        )
+    )
+    backend_b = TextQueryTestBackend(
+        ProcessingPipeline(
+            [
+                ProcessingItem(AddFieldnamePrefixTransformation("b."), identifier="prefix_b"),
+            ]
+        )
+    )
+
+    assert backend_a.convert_rule(rule) == ["'a.field'=\"value\""]
+    assert backend_b.convert_rule(rule) == ["'b.field'=\"value\""]
+    assert rule.detection.detections["sel"].detection_items[0].field == "field"
+    assert backend_a.convert_rule(rule) == ["'a.field'=\"value\""]

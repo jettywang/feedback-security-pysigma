@@ -1,7 +1,14 @@
 import pytest
 from sigma.backends.test import TextQueryTestBackend
 from sigma.collection import SigmaCollection
-from sigma.processing.pipeline import ProcessingPipeline
+from sigma.exceptions import SigmaTransformationError
+from sigma.processing.pipeline import ProcessingPipeline, ProcessingItem
+from sigma.processing.transformations import (
+    FieldMappingTransformation,
+    ReplaceStringTransformation,
+)
+from sigma.processing.transformations.failure import RuleFailureTransformation
+from sigma.processing.transformations.state import SetStateTransformation
 from sigma.rule import SigmaRule
 
 
@@ -481,3 +488,286 @@ detection:
         modified_count = sum(1 for q in queries if isinstance(q, str) and q.startswith("EVEN: "))
         unmodified_count = len(queries) - modified_count
         assert modified_count > 0 or unmodified_count > 0  # At least some should exist
+
+
+FIELD_VALUE_RULE_YAML = """
+title: Isolation Rule
+name: isolation_rule
+logsource:
+    category: test
+detection:
+    sel:
+        field: hello
+    filter:
+        other_field: untouched
+    condition: sel and not filter
+"""
+
+
+def _isolation_rule() -> SigmaRule:
+    return SigmaRule.from_yaml(FIELD_VALUE_RULE_YAML)
+
+
+def _backend(pipeline: ProcessingPipeline) -> TextQueryTestBackend:
+    return TextQueryTestBackend(pipeline)
+
+
+PIPELINE_A = ProcessingPipeline(
+    [
+        ProcessingItem(FieldMappingTransformation({"field": "field_a"}), identifier="map_a"),
+        ProcessingItem(ReplaceStringTransformation("hello", "HELLO_A"), identifier="val_a"),
+        ProcessingItem(SetStateTransformation("index", "index_a"), identifier="state_a"),
+    ]
+)
+PIPELINE_B = ProcessingPipeline(
+    [
+        ProcessingItem(FieldMappingTransformation({"field": "field_b"}), identifier="map_b"),
+        ProcessingItem(ReplaceStringTransformation("hello", "HELLO_B"), identifier="val_b"),
+        ProcessingItem(SetStateTransformation("index", "index_b"), identifier="state_b"),
+    ]
+)
+
+
+def test_convert_rule_does_not_modify_rule_by_default():
+    rule = _isolation_rule()
+    original_detection = rule.detection.to_dict()
+
+    backend = _backend(PIPELINE_A)
+    assert backend.convert_rule(rule) == ['field_a="HELLO_A" and not other_field="untouched"']
+
+    assert rule.detection.to_dict() == original_detection
+    assert not rule.was_processed_by("map_a")
+    assert not rule.was_processed_by("val_a")
+    item = rule.detection.detections["sel"].detection_items[0]
+    assert not item.was_processed_by("map_a")
+
+
+def test_convert_collection_does_not_modify_rules_by_default():
+    collection = SigmaCollection.from_yaml(FIELD_VALUE_RULE_YAML)
+    original_detection = collection.rules[0].detection.to_dict()
+
+    backend = _backend(PIPELINE_A)
+    assert backend.convert(collection) == ['field_a="HELLO_A" and not other_field="untouched"']
+
+    assert collection.rules[0].detection.to_dict() == original_detection
+
+
+def test_convert_rule_a_then_b_are_independent():
+    rule = _isolation_rule()
+    backend_a = _backend(PIPELINE_A)
+    backend_b = _backend(PIPELINE_B)
+
+    result_a = backend_a.convert_rule(rule)
+    result_b = backend_b.convert_rule(rule)
+
+    assert result_a == ['field_a="HELLO_A" and not other_field="untouched"']
+    assert result_b == ['field_b="HELLO_B" and not other_field="untouched"']
+    # Neither pipeline's processed detection or tracking leaked to the rule.
+    assert rule.detection.detections["sel"].detection_items[0].field == "field"
+    assert not rule.was_processed_by("map_a")
+    assert not rule.was_processed_by("map_b")
+
+
+def test_convert_rule_b_then_a_are_independent():
+    rule = _isolation_rule()
+    backend_a = _backend(PIPELINE_A)
+    backend_b = _backend(PIPELINE_B)
+
+    result_b = backend_b.convert_rule(rule)
+    result_a = backend_a.convert_rule(rule)
+
+    assert result_b == ['field_b="HELLO_B" and not other_field="untouched"']
+    assert result_a == ['field_a="HELLO_A" and not other_field="untouched"']
+    assert rule.detection.detections["sel"].detection_items[0].field == "field"
+
+
+def test_convert_rule_alone_matches_sequence_results():
+    backend_a = _backend(PIPELINE_A)
+    backend_b = _backend(PIPELINE_B)
+
+    alone_a = backend_a.convert_rule(_isolation_rule())
+    alone_b = backend_b.convert_rule(_isolation_rule())
+
+    rule = _isolation_rule()
+    assert backend_a.convert_rule(rule) == alone_a
+    assert backend_b.convert_rule(rule) == alone_b
+    # ... and the sequence A->B on the same rule matches each standalone conversion.
+    rule_again = _isolation_rule()
+    assert backend_a.convert_rule(rule_again) == alone_a
+    assert backend_b.convert_rule(rule_again) == alone_b
+
+    rule_third = _isolation_rule()
+    sequence = [backend_a.convert_rule(rule_third), backend_b.convert_rule(rule_third)]
+    assert sequence == [alone_a, alone_b]
+    rule_fourth = _isolation_rule()
+    reverse_sequence = [backend_b.convert_rule(rule_fourth), backend_a.convert_rule(rule_fourth)]
+    assert reverse_sequence == [alone_b, alone_a]
+
+
+def test_convert_collection_a_then_b_are_independent():
+    collection = SigmaCollection.from_yaml(FIELD_VALUE_RULE_YAML)
+    backend_a = _backend(PIPELINE_A)
+    backend_b = _backend(PIPELINE_B)
+
+    result_a = backend_a.convert(collection)
+    result_b = backend_b.convert(collection)
+
+    assert result_a == ['field_a="HELLO_A" and not other_field="untouched"']
+    assert result_b == ['field_b="HELLO_B" and not other_field="untouched"']
+
+
+def test_convert_collection_b_then_a_are_independent():
+    collection = SigmaCollection.from_yaml(FIELD_VALUE_RULE_YAML)
+    backend_a = _backend(PIPELINE_A)
+    backend_b = _backend(PIPELINE_B)
+
+    result_b = backend_b.convert(collection)
+    result_a = backend_a.convert(collection)
+
+    assert result_b == ['field_b="HELLO_B" and not other_field="untouched"']
+    assert result_a == ['field_a="HELLO_A" and not other_field="untouched"']
+
+
+def test_convert_state_uses_only_own_pipeline():
+    rule = _isolation_rule()
+    backend_a = _backend(PIPELINE_A)
+    backend_b = _backend(PIPELINE_B)
+
+    backend_a.convert_rule(rule)
+    # The conversion state committed to the rule must only contain A's pipeline state.
+    assert [state.processing_state for state in rule.get_conversion_states()] == [
+        {"index": "index_a"}
+    ]
+
+    backend_b.convert_rule(rule)
+    assert [state.processing_state for state in rule.get_conversion_states()] == [
+        {"index": "index_b"}
+    ]
+
+
+def test_failed_conversion_does_not_leave_modified_detection():
+    rule = _isolation_rule()
+    original_detection = rule.detection.to_dict()
+    failing_backend = _backend(
+        ProcessingPipeline(
+            [
+                ProcessingItem(
+                    FieldMappingTransformation({"field": "field_a"}),
+                    identifier="map_a",
+                ),
+                ProcessingItem(RuleFailureTransformation("boom")),
+            ]
+        )
+    )
+
+    with pytest.raises(SigmaTransformationError, match="boom"):
+        failing_backend.convert_rule(rule)
+
+    assert rule.detection.to_dict() == original_detection
+    assert not rule.was_processed_by("map_a")
+    assert not rule.was_processed_by("boom")
+
+
+def test_failed_conversion_then_reuse_has_no_leftover_state():
+    rule = _isolation_rule()
+    failing_backend = _backend(
+        ProcessingPipeline(
+            [
+                ProcessingItem(
+                    FieldMappingTransformation({"field": "field_a"}),
+                    identifier="map_a",
+                ),
+                ProcessingItem(SetStateTransformation("index", "stale_index"), identifier="state"),
+                ProcessingItem(RuleFailureTransformation("boom")),
+            ]
+        )
+    )
+    with pytest.raises(SigmaTransformationError, match="boom"):
+        failing_backend.convert_rule(rule)
+
+    healthy_backend = _backend(PIPELINE_B)
+    result = healthy_backend.convert_rule(rule)
+
+    assert result == ['field_b="HELLO_B" and not other_field="untouched"']
+    states = [state.processing_state for state in rule.get_conversion_states()]
+    assert states == [{"index": "index_b"}]
+    assert "map_a" not in healthy_backend.last_processing_pipeline.applied_ids
+    assert "map_b" in healthy_backend.last_processing_pipeline.applied_ids
+
+
+def test_pipeline_reuse_after_failure_does_not_reuse_previous_rule_tracking():
+    first_rule = SigmaRule.from_yaml("""
+title: First
+logsource:
+    category: test
+detection:
+    sel:
+        field_a: value_a
+    condition: sel
+""")
+    second_rule = SigmaRule.from_yaml(FIELD_VALUE_RULE_YAML)
+    failing_backend = _backend(
+        ProcessingPipeline(
+            [
+                ProcessingItem(
+                    FieldMappingTransformation({"field_a": "mapped_a"}),
+                    identifier="map_a",
+                ),
+                ProcessingItem(
+                    FieldMappingTransformation({"field": "mapped_field"}),
+                    identifier="map_field",
+                ),
+                ProcessingItem(RuleFailureTransformation("boom")),
+            ]
+        )
+    )
+
+    with pytest.raises(SigmaTransformationError, match="boom"):
+        failing_backend.convert_rule(first_rule)
+    with pytest.raises(SigmaTransformationError, match="boom"):
+        failing_backend.convert_rule(second_rule)
+
+    # Tracking must only describe the second rule's processing, not the first rule's fields.
+    pipeline = failing_backend.last_processing_pipeline
+    assert set(pipeline.field_mappings) == {"field"}
+    assert "map_a" not in pipeline.field_name_applied_ids.get("mapped_field", set())
+    assert pipeline.state == {}
+
+
+def test_explicit_inplace_mode_keeps_processed_detection_on_rule():
+    rule = _isolation_rule()
+    backend = _backend(PIPELINE_A)
+
+    assert backend.convert_rule(rule, inplace=True) == [
+        'field_a="HELLO_A" and not other_field="untouched"'
+    ]
+
+    assert rule.detection.detections["sel"].detection_items[0].field == "field_a"
+    assert rule.was_processed_by("map_a")
+
+
+def test_explicit_inplace_collection_keeps_processed_detection_on_rules():
+    collection = SigmaCollection.from_yaml(FIELD_VALUE_RULE_YAML)
+    backend = _backend(PIPELINE_A)
+
+    assert backend.convert(collection, inplace=True) == [
+        'field_a="HELLO_A" and not other_field="untouched"'
+    ]
+    assert collection.rules[0].detection.detections["sel"].detection_items[0].field == "field_a"
+
+
+def test_default_and_inplace_results_are_equal():
+    backend_a = _backend(PIPELINE_A)
+    backend_b = _backend(PIPELINE_B)
+
+    assert backend_a.convert_rule(_isolation_rule()) == backend_a.convert_rule(
+        _isolation_rule(), inplace=True
+    )
+    # A second backend converting the same, still unmodified rule must see the same result
+    # as it saw when the first backend converted the rule before.
+    assert backend_b.convert_rule(_isolation_rule()) == [
+        'field_b="HELLO_B" and not other_field="untouched"'
+    ]
+    assert backend_b.convert_rule(_isolation_rule(), inplace=True) == [
+        'field_b="HELLO_B" and not other_field="untouched"'
+    ]

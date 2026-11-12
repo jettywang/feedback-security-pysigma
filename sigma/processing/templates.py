@@ -201,16 +201,22 @@ class TemplateBase:
     restrict_template_path: bool = False
 
     def __post_init__(self) -> None:
+        # Build once eagerly so template configuration and path restrictions are validated
+        # at pipeline construction time. Subsequent access uses the cached template.
+        self.j2template
+
+    def _build_template(self) -> Any:
+        """Build the Jinja2 template object from the declarative attributes."""
         env = SigmaSandboxedEnvironment(autoescape=self.autoescape)
         if self.path is None:
-            self.j2template = env.from_string(self.template)
+            template = env.from_string(self.template)
         else:
             if self.restrict_template_path:
                 self._check_template_path(self.path)
                 env.loader = _ConfinedFileSystemLoader(self.path)
             else:
                 env.loader = FileSystemLoader(self.path)
-            self.j2template = env.get_template(self.template)
+            template = env.get_template(self.template)
 
         # Load custom variables/functions from Python file if provided
         if self.vars is not None:
@@ -222,8 +228,26 @@ class TemplateBase:
                     f"variable {PYSIGMA_ALLOW_VARS_EXECUTION_ENV}=1."
                 )
             custom_vars = self._load_vars_from_file(self.vars)
-            self.j2template.globals.update(custom_vars)
+            template.globals.update(custom_vars)
             env.add_trusted(custom_vars.values())
+
+        return template
+
+    @property
+    def j2template(self) -> Any:
+        """Jinja2 template, built lazily and rebuilt after cloning."""
+        template = self.__dict__.get("_j2template")
+        if template is None:
+            template = self._build_template()
+            self.__dict__["_j2template"] = template
+        return template
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Jinja2 template objects are not picklable. They are rebuilt from the declarative
+        attributes on first use, so clones of pipelines remain usable."""
+        state = self.__dict__.copy()
+        state.pop("_j2template", None)
+        return state
 
     def _check_template_path(self, path: str) -> None:
         """Template directories from untrusted pipeline definitions must reside below one of the

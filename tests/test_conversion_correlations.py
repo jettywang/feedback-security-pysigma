@@ -4,6 +4,7 @@ from sigma.collection import SigmaCollection
 from sigma.exceptions import SigmaBackendError, SigmaConversionError
 from sigma.processing.pipeline import ProcessingPipeline, QueryPostprocessingItem
 from sigma.processing.postprocessing import EmbedQueryTransformation
+from sigma.rule import SigmaRule
 from .test_conversion_base import test_backend
 
 
@@ -1260,3 +1261,175 @@ correlation:
 
     # Verify no results were returned (both rule and correlation skipped)
     assert len(result) == 0
+
+
+def test_correlation_conversion_does_not_modify_collection_by_default(test_backend):
+    collection = SigmaCollection.from_yaml("""
+title: Failed logon
+name: failed_logon
+status: test
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4625
+    condition: selection
+---
+title: Multiple failed logons
+status: test
+correlation:
+    type: event_count
+    rules:
+        - failed_logon
+    timespan: 5m
+    condition:
+        gte: 10
+""")
+    base_rule, correlation_rule = collection.rules
+    original_base_detection = base_rule.detection.to_dict()
+
+    result = test_backend.convert(collection)
+    assert result == [
+        "EventID=4625\n"
+        "| aggregate window=5min count() as event_count\n"
+        "| where event_count >= 10"
+    ]
+
+    assert base_rule.detection.to_dict() == original_base_detection
+    assert not base_rule.was_processed_by("mappingB")
+    # Referenced rules are still intact and still point to each other.
+    assert correlation_rule.referenced_rules[0].rule is base_rule
+
+
+def test_correlation_conversion_commits_referenced_rule_results(test_backend):
+    collection = SigmaCollection.from_yaml("""
+title: Failed logon
+name: failed_logon
+status: test
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4625
+    condition: selection
+---
+title: Multiple failed logons
+status: test
+correlation:
+    type: event_count
+    rules:
+        - failed_logon
+    timespan: 5m
+    condition:
+        gte: 10
+""")
+    base_rule, correlation_rule = collection.rules
+
+    test_backend.convert(collection)
+
+    assert base_rule.get_conversion_result() == ["EventID=4625"]
+    assert correlation_rule.get_conversion_result()
+
+
+def test_correlation_conversion_before_and_after_field_mapping_rule(test_backend):
+    collection = SigmaCollection.from_yaml("""
+title: Failed logon
+name: failed_logon
+status: test
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        fieldB: 4625
+    condition: selection
+---
+title: Multiple failed logons
+status: test
+correlation:
+    type: event_count
+    rules:
+        - failed_logon
+    timespan: 5m
+    condition:
+        gte: 10
+""")
+
+    assert test_backend.convert(collection) == [
+        "mappedB=4625\n| aggregate window=5min count() as event_count\n| where event_count >= 10"
+    ]
+    # Converting again must still apply the pipeline exactly once to the original detection.
+    assert test_backend.convert(collection) == [
+        "mappedB=4625\n| aggregate window=5min count() as event_count\n| where event_count >= 10"
+    ]
+
+
+def test_nested_correlation_conversion_is_isolated_and_repeatable(test_backend):
+    nested_yaml = """
+title: Successful login
+name: successful_login
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID:
+            - 528
+            - 4624
+    condition: selection
+---
+title: Single failed login
+name: failed_login
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID:
+            - 529
+            - 4625
+    condition: selection
+---
+title: Multiple failed logons
+name: multiple_failed_login
+correlation:
+    type: event_count
+    rules:
+        - failed_login
+    generate: false
+    group-by:
+        - User
+    timespan: 10m
+    condition:
+        gte: 10
+---
+title: Multiple Failed Logins Followed by Successful Login
+status: test
+correlation:
+    type: temporal_ordered
+    rules:
+        - multiple_failed_login
+        - successful_login
+    generate: false
+    group-by:
+        - User
+    timespan: 10m
+"""
+    collection = SigmaCollection.from_yaml(nested_yaml)
+    detections_before = [
+        rule.detection.to_dict() if isinstance(rule, SigmaRule) else rule.to_dict()
+        for rule in collection.rules
+    ]
+
+    first = test_backend.convert(collection)
+    second = test_backend.convert(collection)
+
+    assert first == second
+    assert [
+        rule.detection.to_dict() if isinstance(rule, SigmaRule) else rule.to_dict()
+        for rule in collection.rules
+    ] == detections_before
+    for rule in collection.rules:
+        assert rule.applied_processing_items == set()

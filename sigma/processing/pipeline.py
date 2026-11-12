@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import partial
@@ -422,6 +423,24 @@ class ProcessingItemBase:
             for rule_condition in self.rule_conditions.values():
                 rule_condition._clear_pipeline()
 
+    def _bind_to_pipeline(self, pipeline: "ProcessingPipeline") -> None:
+        """Point the item and its contained processing objects to *pipeline*.
+
+        Unlike set_pipeline(), this replaces an existing binding. It is used to reconnect a
+        cloned pipeline's items after deepcopy and is not meant for constructing pipelines.
+        """
+        self._pipeline = pipeline
+        self.transformation._pipeline = pipeline
+        self.transformation.processing_item = self
+        if self.rule_condition_expression is not None:
+            self.rule_condition_expression.pipeline = pipeline
+        if isinstance(self.rule_conditions, list):
+            for rule_condition in self.rule_conditions:
+                rule_condition._pipeline = pipeline
+        elif isinstance(self.rule_conditions, dict):
+            for rule_condition in self.rule_conditions.values():
+                rule_condition._pipeline = pipeline
+
 
 @dataclass
 class ProcessingItem(ProcessingItemBase):
@@ -563,6 +582,26 @@ class ProcessingItem(ProcessingItemBase):
             field_name_conditions = self.field_name_conditions
         for field_name_condition in field_name_conditions:
             field_name_condition._clear_pipeline()
+
+    def _bind_to_pipeline(self, pipeline: "ProcessingPipeline") -> None:
+        super()._bind_to_pipeline(pipeline)
+        if self.detection_item_condition_expression is not None:
+            self.detection_item_condition_expression.pipeline = pipeline
+        if isinstance(self.detection_item_conditions, dict):
+            detection_item_conditions = list(self.detection_item_conditions.values())
+        else:
+            detection_item_conditions = self.detection_item_conditions
+        for detection_item_condition in detection_item_conditions:
+            detection_item_condition._pipeline = pipeline
+
+        if self.field_name_condition_expression is not None:
+            self.field_name_condition_expression.pipeline = pipeline
+        if isinstance(self.field_name_conditions, dict):
+            field_name_conditions = list(self.field_name_conditions.values())
+        else:
+            field_name_conditions = self.field_name_conditions
+        for field_name_condition in field_name_conditions:
+            field_name_condition._pipeline = pipeline
 
     def apply(self, rule: SigmaRule | SigmaCorrelationRule) -> bool:
         """
@@ -797,6 +836,45 @@ class ProcessingPipeline:
         for finalizer in self.finalizers:
             finalizer.set_pipeline(self)
 
+    def clone(self) -> "ProcessingPipeline":
+        """Return an independent deep copy of this pipeline.
+
+        The copy owns its own processing items, transformations, conditions, variables and
+        runtime tracking attributes. Transformation, condition and finalizer objects inside the
+        clone are re-bound to the cloned pipeline, so processing the clone never writes tracking
+        or state into the source pipeline. Policies and other immutable runtime configuration are
+        shared.
+        """
+        clone = copy.deepcopy(self)
+        clone._rebind_pipeline()
+        return clone
+
+    def _rebind_pipeline(self) -> None:
+        """Bind all contained items and their processing objects to this pipeline instance.
+
+        Used after cloning: deepcopy preserves the object graph but the pipelines referenced from
+        transformations, conditions and finalizers must be pointed to the clone itself.
+        """
+        for processing_item in self.items:
+            processing_item._bind_to_pipeline(self)
+        for postprocessing_item in self.postprocessing_items:
+            postprocessing_item._bind_to_pipeline(self)
+        for finalizer in self.finalizers:
+            finalizer._bind_to_pipeline(self)
+
+    def reset_runtime_state(self) -> None:
+        """Reset all state collected while processing a rule.
+
+        Called before every rule so that a pipeline instance can be reused without leaking the
+        applied items, field mappings or pipeline state of a previous rule, including previous
+        rules that failed during processing.
+        """
+        self.applied = list()
+        self.applied_ids = set()
+        self.field_name_applied_ids = defaultdict(set)
+        self.field_mappings = FieldMappingTracking()
+        self.state = dict()
+
     def _clear_pipeline(self) -> None:
         for processing_item in self.items:
             processing_item._clear_pipeline()
@@ -960,12 +1038,14 @@ class ProcessingPipeline:
         )
 
     def apply(self, rule: SigmaRule | SigmaCorrelationRule) -> SigmaRule | SigmaCorrelationRule:
-        """Apply processing pipeline on Sigma rule."""
-        self.applied = list()
-        self.applied_ids = set()
-        self.field_name_applied_ids = defaultdict(set)
-        self.field_mappings = FieldMappingTracking()
-        self.state = dict()
+        """Apply processing pipeline on Sigma rule.
+
+        Runtime state of a previous rule is discarded first, so a failed application of a
+        previous rule cannot leak its applied item tracking, field mappings or pipeline state
+        into this rule. Note that transformations still modify *rule* in place; callers that need
+        to keep the original rule must pass a copy (see ``Backend.convert``).
+        """
+        self.reset_runtime_state()
         for item in self.items:
             applied = item.apply(rule)
             self.applied.append(applied)

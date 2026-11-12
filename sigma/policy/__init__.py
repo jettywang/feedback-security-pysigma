@@ -19,6 +19,10 @@ class SigmaPolicy:
     vars_allowed_paths: tuple[str, ...] | None = None
     allow_external_sources: bool = False
 
+    def __deepcopy__(self, memo: dict[int, object]) -> "SigmaPolicy":
+        """Policies are immutable runtime configuration; cloned pipelines share them."""
+        return self
+
 
 from sigma.policy.profiles import SafePolicy  # noqa: E402
 

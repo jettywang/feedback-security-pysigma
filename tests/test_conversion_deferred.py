@@ -384,3 +384,47 @@ def test_deferred_conversion_or_single_deferred_with_empty():
     assert DroppingDeferredTextQueryTestBackend().convert(deferred_or_rule("sel1 or sel3")) == [
         '* | mappedA="foo.*bar"'
     ]
+
+
+def test_deferred_conversion_reuse_after_failed_conversion(test_backend):
+    """Deferred query parts are per conversion; a failed conversion must not leak them."""
+    from sigma.backends.test import TextQueryTestBackend
+    from sigma.processing.pipeline import ProcessingItem, ProcessingPipeline
+    from sigma.processing.transformations import FieldMappingTransformation
+    from sigma.processing.transformations.failure import RuleFailureTransformation
+    from sigma.exceptions import SigmaTransformationError
+    from sigma.rule import SigmaRule
+
+    rule = SigmaRule.from_yaml("""
+            title: Test
+            status: test
+            logsource:
+                category: test_category
+                product: test_product
+            detection:
+                sel:
+                    fieldA|re: foo.*bar
+                    fieldB: foo
+                condition: sel
+        """)
+
+    expected = ['fieldB="foo" | mappedA="foo.*bar"']
+    assert test_backend.convert_rule(rule) == expected
+
+    failing_backend = TextQueryTestBackend(
+        ProcessingPipeline(
+            [
+                ProcessingItem(
+                    FieldMappingTransformation({"fieldA": "mappedA"}),
+                    identifier="map",
+                ),
+                ProcessingItem(RuleFailureTransformation("boom")),
+            ]
+        )
+    )
+    with pytest.raises(SigmaTransformationError, match="boom"):
+        failing_backend.convert_rule(rule)
+
+    # The rule is unmodified and the next conversion has its own deferred query parts.
+    assert test_backend.convert_rule(rule) == expected
+    assert rule.detection.detections["sel"].detection_items[0].field == "fieldA"

@@ -34,6 +34,10 @@ class Finalizer:
         else:
             raise SigmaTransformationError("Pipeline for finalizer was already set.")
 
+    def _bind_to_pipeline(self, pipeline: "ProcessingPipeline") -> None:
+        """Reconnect the finalizer to *pipeline* after cloning, replacing an old binding."""
+        self._pipeline = pipeline
+
     @abstractmethod
     def apply(self, queries: list[Any]) -> Any:
         """Finalize output by applying a transformation to the list of generated and postprocessed queries.
