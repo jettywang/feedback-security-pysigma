@@ -1,0 +1,119 @@
+title: literal_star plain scalar
+name: literal_star_plain
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine: C:\Windows\System32\evil\*.exe
+    condition: selection
+---
+title: literal_star single scalar
+name: literal_star_single
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine: 'C:\Windows\System32\evil\*.exe'
+    condition: selection
+---
+title: literal_star double scalar
+name: literal_star_double
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine: "C:\\Windows\\System32\\evil\\*.exe"
+    condition: selection
+---
+title: wildcard_internal plain scalar
+name: wildcard_internal_plain
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine: C:\Windows\System32\\*\evil.exe
+    condition: selection
+---
+title: wildcard_internal single scalar
+name: wildcard_internal_single
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine: 'C:\Windows\System32\\*\evil.exe'
+    condition: selection
+---
+title: wildcard_internal double scalar
+name: wildcard_internal_double
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine: "C:\\Windows\\System32\\\\*\\evil.exe"
+    condition: selection
+---
+title: trailing_backslash plain scalar
+name: trailing_backslash_plain
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine: C:\Windows\System32\
+    condition: selection
+---
+title: trailing_backslash single scalar
+name: trailing_backslash_single
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine: 'C:\Windows\System32\'
+    condition: selection
+---
+title: trailing_backslash double scalar
+name: trailing_backslash_double
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine: "C:\\Windows\\System32\\"
+    condition: selection
+---
+title: mixed_segments plain scalar
+name: mixed_segments_plain
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine: C:\Windows\System32\logs\\?\evil\*.exe
+    condition: selection
+---
+title: mixed_segments single scalar
+name: mixed_segments_single
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine: 'C:\Windows\System32\logs\\?\evil\*.exe'
+    condition: selection
+---
+title: mixed_segments double scalar
+name: mixed_segments_double
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine: "C:\\Windows\\System32\\logs\\\\?\\evil\\*.exe"
+    condition: selection
