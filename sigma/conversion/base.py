@@ -1618,6 +1618,7 @@ class TextQueryBackend(Backend):
             else:
                 joiner = self.token_separator + self.or_token + self.token_separator
 
+            combined_deferred_count = len(state.combined_deferred)
             converted_args = [
                 (
                     self.convert_condition(arg, state)
@@ -1626,7 +1627,24 @@ class TextQueryBackend(Backend):
                 )
                 for arg in cond.args
             ]
+            operand_deferred = any(
+                isinstance(converted, DeferredQueryExpression) for converted in converted_args
+            )
+            subtree_deferred = len(state.combined_deferred) > combined_deferred_count
             state.add_combined_deferred_expressions(converted_args)
+            effective_args = [converted for converted in converted_args if converted is not None]
+            if len(effective_args) > 1 and (operand_deferred or subtree_deferred):
+                # Deferred expressions are applied as an additional filter on the result of
+                # the main query, i.e. they are AND-linked to the whole query. An OR that
+                # contains one on any branch can therefore not be expressed: dropping the
+                # deferred operand would broaden the OR, while appending it would turn the OR
+                # into an AND. This includes deferred expressions nested in an AND branch.
+                raise SigmaFeatureNotSupportedByBackendError(
+                    "OR condition containing deferred query expressions (e.g. regular"
+                    " expressions or field references that are applied after the main query)"
+                    " is not supported by the backend",
+                    source=cond.source,
+                )
             args = [
                 converted
                 for converted in converted_args
@@ -1643,16 +1661,6 @@ class TextQueryBackend(Backend):
                     # Only one deferred argument: pass it to the parent, so the rule is still
                     # finished as deferred-only query instead of being dropped.
                     return deferred_args[0]
-                elif len(deferred_args) > 1:
-                    # Deferred expressions are applied as additional filters on the result of
-                    # the main query, which can only express an AND of them. Dropping the OR
-                    # would silently drop the whole rule.
-                    raise SigmaFeatureNotSupportedByBackendError(
-                        "OR condition consisting only of deferred query expressions (e.g."
-                        " regular expressions or field references that are applied after the"
-                        " main query) is not supported by the backend",
-                        source=cond.source,
-                    )
                 return self.empty_or_expression
             else:
                 return joiner.join(args)

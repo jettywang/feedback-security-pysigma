@@ -25,8 +25,10 @@ class ConversionState:
 
     deferred: list[DeferredQueryExpression] = field(default_factory=list)
     processing_state: Mapping[str, Any] = field(default_factory=dict)
-    # Deferred expressions that were returned as operands of AND/OR conditions. They are applied
-    # as filters on the main query result, which is not equivalent below a negation.
+    # Deferred expressions that were returned as operands of an AND/OR condition. They are
+    # applied as filters on the main query result, which is not equivalent below a negation or
+    # inside an OR branch. Backends track them to reject such conditions instead of promoting
+    # the deferred part to a global filter.
     combined_deferred: list[DeferredQueryExpression] = field(
         default_factory=list, init=False, repr=False, compare=False
     )

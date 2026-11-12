@@ -79,7 +79,11 @@ def test_deferred_conversion_and(test_backend: TextQueryTestBackend):
 
 
 def test_deferred_conversion_or(test_backend: TextQueryTestBackend):
-    assert test_backend.convert(SigmaCollection.from_yaml("""
+    # "sel1 or sel2 or sel3" contains a deferred regex on the left branch. Appending it to
+    # the main query would AND it with the OR of the plain branches, so it must be rejected
+    # instead of silently narrowing or broadening the rule.
+    with pytest.raises(SigmaFeatureNotSupportedByBackendError, match="OR condition"):
+        test_backend.convert(SigmaCollection.from_yaml("""
             title: Test
             status: test
             logsource:
@@ -93,7 +97,7 @@ def test_deferred_conversion_or(test_backend: TextQueryTestBackend):
                 sel3:
                     fieldC: bar
                 condition: sel1 or sel2 or sel3
-        """)) == ['fieldB="foo" or fieldC="bar" | mappedA="foo.*bar"']
+        """))
 
 
 def test_deferred_conversion_multiple_cond(test_backend: TextQueryTestBackend):
@@ -353,13 +357,20 @@ detection:
 
 @pytest.mark.parametrize(
     "condition",
-    ["sel_list", "sel1 or sel2", "sel1 or sel_list", "sel3 and (sel1 or sel2)"],
+    [
+        "sel_list",
+        "sel1 or sel2",
+        "sel1 or sel_list",
+        "sel3 and (sel1 or sel2)",
+        "sel3 or (sel1 and sel2)",
+        "sel1 or (sel2 or sel_list)",
+    ],
 )
 def test_deferred_conversion_all_deferred_or_unsupported(
     test_backend: TextQueryTestBackend, condition
 ):
-    # An OR of deferred expressions can't be expressed by appending them to the main query
-    # (this would AND them). The rule must not be dropped silently.
+    # An OR containing deferred expressions on any branch can't be expressed by appending
+    # them to the main query (this would AND them). The rule must not be dropped silently.
     with pytest.raises(SigmaFeatureNotSupportedByBackendError, match="OR condition"):
         test_backend.convert(deferred_or_rule(condition))
 
@@ -384,3 +395,254 @@ def test_deferred_conversion_or_single_deferred_with_empty():
     assert DroppingDeferredTextQueryTestBackend().convert(deferred_or_rule("sel1 or sel3")) == [
         '* | mappedA="foo.*bar"'
     ]
+
+
+class ScopeDeferredTextQueryTestBackend(DeferredTextQueryTestBackend):
+    """Minimal text backend used to probe deferred scope semantics.
+
+    In-expressions are disabled so that every leaf keeps its own condition node and the
+    converted text can be evaluated as a small boolean expression. Deferred filters are
+    appended after the main query with ``deferred_start`` and are interpreted by the test
+    helper below as AND-linked filters on the events selected by the main query.
+    """
+
+    convert_or_as_in = False
+    convert_and_as_in = False
+
+
+scope_backend = ScopeDeferredTextQueryTestBackend()
+
+
+def _scope_rule(condition: str):
+    return SigmaCollection.from_yaml(f"""
+title: Test
+status: test
+logsource:
+    category: test_category
+    product: test_product
+detection:
+    a:
+        fieldB: foo
+    b:
+        fieldC: bar
+    r:
+        fieldA|re: foo.*bar
+    s:
+        fieldD|re: bar.*baz
+    condition: {condition}
+""").rules[0]
+
+
+def _leaf_value(cond, event):
+    from sigma.types import SigmaRegularExpression, SigmaString
+
+    actual = event.get(cond.field, "")
+    if isinstance(cond.value, SigmaString):
+        return str(actual).lower() == str(cond.value).lower()
+    if isinstance(cond.value, SigmaRegularExpression):
+        import re
+
+        return re.search(str(cond.value.regexp), str(actual)) is not None
+    raise TypeError(type(cond.value))
+
+
+def _evaluate_condition_tree(cond, event):
+    """Evaluate the original Sigma condition tree directly on a dict event."""
+    from sigma.conditions import (
+        ConditionAND,
+        ConditionFieldEqualsValueExpression,
+        ConditionNOT,
+        ConditionOR,
+        ConditionValueExpression,
+    )
+
+    if isinstance(cond, ConditionAND):
+        return all(_evaluate_condition_tree(arg, event) for arg in cond.args)
+    if isinstance(cond, ConditionOR):
+        return any(_evaluate_condition_tree(arg, event) for arg in cond.args)
+    if isinstance(cond, ConditionNOT):
+        return not _evaluate_condition_tree(cond.args[0], event)
+    if isinstance(cond, (ConditionFieldEqualsValueExpression, ConditionValueExpression)):
+        return _leaf_value(cond, event)
+    raise TypeError(type(cond))
+
+
+def _evaluate_query(query: str, event):
+    """Evaluate the test backend query: main expression, then AND-linked deferred filters."""
+    import re
+
+    main, *filters = (part.strip() for part in query.split("|"))
+    tokens = re.findall(r'\(|\)|!=|=|\band\b|\bor\b|\bnot\b|"[^"]*"|\w+', main)
+    position = 0
+
+    def peek():
+        return tokens[position] if position < len(tokens) else None
+
+    def take():
+        nonlocal position
+        token = tokens[position]
+        position += 1
+        return token
+
+    def atom():
+        if peek() == "(":
+            take()
+            value = expr_or()
+            assert take() == ")"
+            return value
+        if peek() == "not":
+            take()
+            return not atom()
+        field, operator, value = take(), take(), take().strip('"')
+        actual = str(event.get(field, ""))
+        return actual.lower() == value.lower() if operator == "=" else actual != value
+
+    def expr_and():
+        value = atom()
+        while peek() == "and":
+            take()
+            value = atom() and value
+        return value
+
+    def expr_or():
+        value = expr_and()
+        while peek() == "or":
+            take()
+            value = expr_and() or value
+        return value
+
+    result = True if main == "*" else expr_or()
+    assert position == len(tokens), tokens
+    for deferred_filter in filters:
+        match = re.fullmatch(r"([A-Za-z0-9_]+)(!?=)([\"'])(.*?)([\"'])$", deferred_filter)
+        assert match, deferred_filter
+        field, operator, _, value, _ = match.groups()
+        matched = re.search(value, str(event.get(field, ""))) is not None
+        result = result and (not matched if operator == "!=" else matched)
+    return result
+
+
+SCOPE_EVENTS = [
+    {"fieldB": "foo", "fieldC": "bar", "fieldA": "fooXXbar", "fieldD": "barXXbaz"},
+    {"fieldB": "foo", "fieldC": "nope", "fieldA": "nope", "fieldD": "nope"},
+    {"fieldB": "nope", "fieldC": "bar", "fieldA": "nope", "fieldD": "nope"},
+    {"fieldB": "nope", "fieldC": "nope", "fieldA": "fooXXbar", "fieldD": "barXXbaz"},
+    {"fieldB": "nope", "fieldC": "nope", "fieldA": "fooXXbar", "fieldD": "nope"},
+    {"fieldB": "foo", "fieldC": "bar", "fieldA": "nope", "fieldD": "barXXbaz"},
+    {"fieldB": "foo", "fieldC": "nope", "fieldA": "fooXXbar", "fieldD": "nope"},
+    {"fieldB": "nope", "fieldC": "bar", "fieldA": "fooXXbar", "fieldD": "barXXbaz"},
+]
+
+
+def test_deferred_conversion_or_scope_rejected_with_distinguishing_event():
+    # "a or r" is true for the event {"fieldB": "nope", "fieldA": "fooXXbar"}. The backend used
+    # to emit 'fieldB="foo" | mappedA="foo.*bar"', which only matches events satisfying
+    # fieldB="foo" *and* the deferred regex. Event 4 is selected by the expected query but
+    # missed by the buggy promotion of the deferred branch to a global filter.
+    rule = _scope_rule("a or r")
+    condition = rule.detection.parsed_condition[0].parsed
+    event = SCOPE_EVENTS[4]
+    assert _evaluate_condition_tree(condition, event) is True
+    with pytest.raises(SigmaFeatureNotSupportedByBackendError, match="OR condition"):
+        scope_backend.convert_rule(rule)
+
+
+def test_deferred_conversion_and_scope_is_equivalent():
+    # Plain AND with a deferred operand is expressible: deferred filters AND-link to the
+    # whole main query, which is exactly the meaning of the Sigma condition.
+    condition = "a and r"
+    rule = _scope_rule(condition)
+    query = scope_backend.convert_rule(rule)[0]
+    expected = [
+        _evaluate_condition_tree(rule.detection.parsed_condition[0].parsed, event)
+        for event in SCOPE_EVENTS
+    ]
+    actual = [_evaluate_query(query, event) for event in SCOPE_EVENTS]
+    assert query == 'fieldB="foo" | mappedA="foo.*bar"'
+    assert expected == actual
+
+
+def test_deferred_conversion_and_and_not_scope_is_equivalent():
+    # "a and not r" negates the deferred leaf itself, so the deferred operator is flipped
+    # and the filter remains equivalent to the original condition.
+    rule = _scope_rule("a and not r")
+    query = scope_backend.convert_rule(rule)[0]
+    expected = [
+        _evaluate_condition_tree(rule.detection.parsed_condition[0].parsed, event)
+        for event in SCOPE_EVENTS
+    ]
+    actual = [_evaluate_query(query, event) for event in SCOPE_EVENTS]
+    assert query == 'fieldB="foo" | mappedA!="foo.*bar"'
+    assert expected == actual
+
+
+def test_deferred_conversion_not_inside_and_scope_rejected():
+    # "not (a or r)" can't be expressed as a global deferred filter. The backend rejects it
+    # rather than emitting a query where the negation only covers the plain branch.
+    rule = _scope_rule("not (a or r)")
+    event = SCOPE_EVENTS[1]  # fieldB="foo", fieldA="nope": original condition is false
+    assert _evaluate_condition_tree(rule.detection.parsed_condition[0].parsed, event) is False
+    # The negated OR is rejected by the OR guard before the NOT-specific guard triggers.
+    with pytest.raises(SigmaFeatureNotSupportedByBackendError, match="deferred query expressions"):
+        scope_backend.convert_rule(rule)
+
+
+def test_deferred_conversion_multi_rule_scope_isolation():
+    # Consecutive compilation must keep deferred state per rule. The supported AND rule is
+    # emitted, the OR rule is rejected, and a later rule must not see leftover filters from
+    # the previous rule.
+    collection = SigmaCollection.from_yaml("""
+title: Supported AND
+status: test
+logsource:
+    category: test_category
+    product: test_product
+detection:
+    a:
+        fieldB: foo
+    r:
+        fieldA|re: foo.*bar
+    condition: a and r
+---
+title: Unsupported OR
+status: test
+logsource:
+    category: test_category
+    product: test_product
+detection:
+    a:
+        fieldB: foo
+    r:
+        fieldA|re: foo.*bar
+    condition: a or r
+---
+title: Later plain rule
+status: test
+logsource:
+    category: test_category
+    product: test_product
+detection:
+    a:
+        fieldB: foo
+    condition: a
+---
+title: Later AND rule
+status: test
+logsource:
+    category: test_category
+    product: test_product
+detection:
+    a:
+        fieldB: foo
+    r:
+        fieldA|re: foo.*bar
+    condition: r
+""")
+    backend = ScopeDeferredTextQueryTestBackend(collect_errors=True)
+    queries = backend.convert(collection)
+    assert queries == [
+        'fieldB="foo" | mappedA="foo.*bar"',
+        'fieldB="foo"',
+        '* | mappedA="foo.*bar"',
+    ]
+    assert [type(error) for _, error in backend.errors] == [SigmaFeatureNotSupportedByBackendError]
