@@ -11,6 +11,7 @@ from sigma.processing.regex import ProcessingRegularExpressionMixin
 from sigma.rule import SigmaRule, SigmaDetection, SigmaDetectionItem
 from sigma.exceptions import (
     SigmaConfigurationError,
+    SigmaRuleLocation,
     SigmaTransformationError,
 )
 from sigma.types import (
@@ -277,22 +278,60 @@ class FieldMappingTransformationBase(DetectionItemTransformation):
 
         return super().apply(rule)
 
+    def _raise_ambiguous_field_reference(
+        self,
+        left_field: str | None,
+        left_mapping: list[str],
+        right_field: str,
+        right_mapping: list[str],
+        source: SigmaRuleLocation | None,
+    ) -> None:
+        raise SigmaTransformationError(
+            "Field reference comparison "
+            f"'{left_field}' (mapped to {left_mapping}) against referenced field "
+            f"'{right_field}' (mapped to {right_mapping}) can't be expressed unambiguously: "
+            "both sides of the comparison map to multiple field names. A one-to-many mapping is "
+            "only supported on one side of a field reference comparison because the resulting "
+            "pairing of the candidate fields can't be determined without additional information.",
+            source=source,
+        )
+
     def apply_detection_item(
         self, detection_item: SigmaDetectionItem
     ) -> (SigmaDetection | SigmaDetectionItem) | None:
         """Apply field name transformations to field references in detection item values."""
+        field = detection_item.field
+        field_mapping = self.apply_field_name(field)
+        field_match = field_mapping is not None and (
+            self.processing_item is None or self.processing_item.match_field_name(field)
+        )
+        if isinstance(field_mapping, str):
+            left_mapping: list[str] = [field_mapping]
+        elif field_mapping is not None:
+            left_mapping = list(field_mapping)
+        else:
+            left_mapping = [field] if field is not None else []
+
         new_values: list[SigmaType] = []
         fieldref_match = False
         for value in detection_item.value:
             if isinstance(value, SigmaFieldReference) and (
                 self.processing_item is None or self.processing_item.match_field_in_value(value)
             ):
-                new_values.extend(
-                    (
-                        SigmaFieldReference(mapped_field, value.starts_with, value.ends_with)
-                        for mapped_field in self._apply_field_name(value.field)
+                right_mapping = self._apply_field_name(value.field)
+                # A field-to-field comparison where both the compared field and the referenced
+                # field expand to multiple candidates can't be represented unambiguously: neither a
+                # Cartesian product nor a positional pairing has a well-defined meaning, therefore
+                # the transformation is rejected instead of silently generating cross-pairings.
+                if len(left_mapping) > 1 and len(right_mapping) > 1:
+                    self._raise_ambiguous_field_reference(
+                        field, left_mapping, value.field, right_mapping, detection_item.source
                     )
-                )
+                mapped_references = [
+                    SigmaFieldReference(mapped_field, value.starts_with, value.ends_with)
+                    for mapped_field in right_mapping
+                ]
+                new_values.extend(mapped_references)
                 fieldref_match = True
             else:
                 new_values.append(value)
@@ -301,15 +340,9 @@ class FieldMappingTransformationBase(DetectionItemTransformation):
             detection_item.value = new_values
             result: SigmaDetectionItem | SigmaDetection = detection_item
 
-        field = detection_item.field
-        mapping = self.apply_field_name(field)
-        field_match = False
-        if mapping is not None and (
-            self.processing_item is None or self.processing_item.match_field_name(field)
-        ):
-            field_match = True
+        if field_match:
             # If mapping from None (keyword) to a field, add wildcards to preserve keyword semantics
-            if field is None and isinstance(mapping, (str, list)):
+            if field is None and isinstance(field_mapping, (str, list)):
                 # Wrap string values with wildcards to maintain keyword search behavior
                 new_values = []
                 for value in detection_item.value:
@@ -318,21 +351,23 @@ class FieldMappingTransformationBase(DetectionItemTransformation):
                     new_values.append(value)
                 detection_item.value = new_values
 
-            if isinstance(mapping, str):  # 1:1 mapping, map field name of detection item directly
-                detection_item.field = mapping
+            if isinstance(
+                field_mapping, str
+            ):  # 1:1 mapping, map field name of detection item directly
+                detection_item.field = field_mapping
                 self.processing_item_applied(detection_item)
                 result = detection_item
-            else:
+            elif field_mapping is not None:
                 result = SigmaDetection(
                     [
-                        dataclasses.replace(detection_item, field=field, auto_modifiers=False)
-                        for field in mapping
+                        dataclasses.replace(detection_item, field=candidate, auto_modifiers=False)
+                        for candidate in field_mapping
                     ],
                     item_linking=ConditionOR,
                 )
         if field_match or fieldref_match:  # field name was changed or field reference was mapped
-            if self._pipeline is not None and mapping is not None:
-                self._pipeline.field_mappings.add_mapping(field, mapping)
+            if self._pipeline is not None and field_mapping is not None:
+                self._pipeline.field_mappings.add_mapping(field, field_mapping)
             return result
         return None  # no replacement was made
 

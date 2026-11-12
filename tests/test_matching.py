@@ -5,7 +5,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from sigma.collection import SigmaCollection
+from sigma.exceptions import SigmaTransformationError
 from sigma.matching import Event, EventLogSource, SigmaMatch, SigmaMatcher
+from sigma.processing.pipeline import ProcessingItem, ProcessingPipeline
+from sigma.processing.transformations import FieldMappingTransformation
 
 
 @pytest.fixture
@@ -1443,3 +1446,217 @@ detection:
         assert len(self._match(yaml_str, {"field": "test\ndata"})) == 1  # dot matches newline
         assert len(self._match(yaml_str, {"field": "testXdata"})) == 1
         assert len(self._match(yaml_str, {"field": "no match"})) == 0
+
+
+class TestFieldReferenceMatchingWithMapping:
+    """End-to-end field-to-field equality matching after field name mapping."""
+
+    RULE = """
+title: Field equality across accounts
+name: field_equality
+status: test
+logsource:
+    category: test
+    product: test
+detection:
+    selection:
+        source_account|fieldref: target_account
+    condition: selection
+"""
+
+    def _match_with_pipeline(self, mapping: dict, data: dict):
+        collection = SigmaCollection.from_yaml(self.RULE)
+        pipeline = ProcessingPipeline([ProcessingItem(FieldMappingTransformation(mapping))])
+        with SigmaMatcher(collection, pipeline=pipeline) as matcher:
+            event = Event(
+                timestamp=datetime.now(tz=timezone.utc),
+                logsource=EventLogSource(category="test", product="test"),
+                data=data,
+            )
+            return matcher.match(event)
+
+    def test_both_sides_mapped_equality_matches(self):
+        mapping = {
+            "source_account": "src_acct",
+            "target_account": "dst_acct",
+        }
+        equal_values = {"src_acct": "acct-111", "dst_acct": "acct-111"}
+        different_values = {"src_acct": "acct-111", "dst_acct": "acct-222"}
+        assert len(self._match_with_pipeline(mapping, equal_values)) == 1
+        assert self._match_with_pipeline(mapping, different_values) == []
+
+    def test_only_left_side_mapped(self):
+        mapping = {"source_account": "src_acct"}
+        equal_values = {"src_acct": "acct-111", "target_account": "acct-111"}
+        different_values = {"src_acct": "acct-111", "target_account": "acct-222"}
+        assert len(self._match_with_pipeline(mapping, equal_values)) == 1
+        assert self._match_with_pipeline(mapping, different_values) == []
+
+    def test_only_right_side_mapped_stays_field_reference(self):
+        # If the referenced field were wrongly treated as a plain string constant,
+        # every event carrying the source field would match regardless of its value.
+        mapping = {"target_account": "dst_acct"}
+        equal_values = {"source_account": "acct-111", "dst_acct": "acct-111"}
+        different_values = {"source_account": "acct-111", "dst_acct": "acct-222"}
+        assert len(self._match_with_pipeline(mapping, equal_values)) == 1
+        assert self._match_with_pipeline(mapping, different_values) == []
+
+    def test_left_one_to_many_candidates(self):
+        mapping = {
+            "source_account": ["src_acct_primary", "src_acct_alias"],
+            "target_account": "dst_acct",
+        }
+        # Equality against either of the mapped source candidates triggers.
+        assert (
+            len(
+                self._match_with_pipeline(
+                    mapping,
+                    {"src_acct_primary": "acct-111", "dst_acct": "acct-111"},
+                )
+            )
+            == 1
+        )
+        assert (
+            len(
+                self._match_with_pipeline(
+                    mapping,
+                    {"src_acct_alias": "acct-111", "dst_acct": "acct-111"},
+                )
+            )
+            == 1
+        )
+        # No candidate equals the target field, therefore nothing triggers.
+        assert (
+            self._match_with_pipeline(
+                mapping,
+                {
+                    "src_acct_primary": "acct-111",
+                    "src_acct_alias": "acct-222",
+                    "dst_acct": "acct-999",
+                },
+            )
+            == []
+        )
+
+    def test_right_one_to_many_candidates(self):
+        mapping = {
+            "source_account": "src_acct",
+            "target_account": ["dst_acct_primary", "dst_acct_alias"],
+        }
+        assert (
+            len(
+                self._match_with_pipeline(
+                    mapping,
+                    {"src_acct": "acct-111", "dst_acct_primary": "acct-111"},
+                )
+            )
+            == 1
+        )
+        assert (
+            len(
+                self._match_with_pipeline(
+                    mapping,
+                    {"src_acct": "acct-111", "dst_acct_alias": "acct-111"},
+                )
+            )
+            == 1
+        )
+        assert (
+            self._match_with_pipeline(
+                mapping,
+                {
+                    "src_acct": "acct-111",
+                    "dst_acct_primary": "acct-222",
+                    "dst_acct_alias": "acct-333",
+                },
+            )
+            == []
+        )
+
+    def test_both_sides_one_to_many_rejected(self):
+        mapping = {
+            "source_account": ["src_a", "src_b"],
+            "target_account": ["dst_a", "dst_b"],
+        }
+        collection = SigmaCollection.from_yaml(self.RULE)
+        pipeline = ProcessingPipeline([ProcessingItem(FieldMappingTransformation(mapping))])
+        with pytest.raises(SigmaTransformationError, match="can't be expressed unambiguously"):
+            SigmaMatcher(collection, pipeline=pipeline)
+
+
+class TestNegatedFieldReferenceMatchingWithMapping:
+    """Negated field-to-field comparisons express cross-account operations and keep meaning."""
+
+    RULE = """
+title: Cross-account operation
+name: cross_account
+status: test
+logsource:
+    category: test
+    product: test
+detection:
+    selection:
+        source_account|fieldref: target_account
+    condition: not selection
+"""
+
+    def _match_with_pipeline(self, mapping: dict, data: dict):
+        collection = SigmaCollection.from_yaml(self.RULE)
+        pipeline = ProcessingPipeline([ProcessingItem(FieldMappingTransformation(mapping))])
+        with SigmaMatcher(collection, pipeline=pipeline) as matcher:
+            event = Event(
+                timestamp=datetime.now(tz=timezone.utc),
+                logsource=EventLogSource(category="test", product="test"),
+                data=data,
+            )
+            return matcher.match(event)
+
+    def test_negated_both_sides_mapped(self):
+        mapping = {
+            "source_account": "src_acct",
+            "target_account": "dst_acct",
+        }
+        # Different accounts -> the equality is false -> negation triggers.
+        cross_account = {"src_acct": "acct-111", "dst_acct": "acct-222"}
+        # Same account -> equality is true -> negation must not trigger.
+        same_account = {"src_acct": "acct-111", "dst_acct": "acct-111"}
+        assert len(self._match_with_pipeline(mapping, cross_account)) == 1
+        assert self._match_with_pipeline(mapping, same_account) == []
+
+    def test_negated_left_one_to_many(self):
+        mapping = {
+            "source_account": ["src_acct_a", "src_acct_b"],
+            "target_account": "dst_acct",
+        }
+        # Every source candidate differs from the target -> cross-account triggers.
+        cross_account = {
+            "src_acct_a": "acct-111",
+            "src_acct_b": "acct-111",
+            "dst_acct": "acct-222",
+        }
+        # One source candidate equals the target -> inner OR is true -> no trigger.
+        same_account = {
+            "src_acct_a": "acct-111",
+            "src_acct_b": "acct-111",
+            "dst_acct": "acct-111",
+        }
+        assert len(self._match_with_pipeline(mapping, cross_account)) == 1
+        assert self._match_with_pipeline(mapping, same_account) == []
+
+    def test_negated_right_one_to_many(self):
+        mapping = {
+            "source_account": "src_acct",
+            "target_account": ["dst_acct_a", "dst_acct_b"],
+        }
+        cross_account = {
+            "src_acct": "acct-111",
+            "dst_acct_a": "acct-222",
+            "dst_acct_b": "acct-333",
+        }
+        same_account = {
+            "src_acct": "acct-111",
+            "dst_acct_a": "acct-111",
+            "dst_acct_b": "acct-333",
+        }
+        assert len(self._match_with_pipeline(mapping, cross_account)) == 1
+        assert self._match_with_pipeline(mapping, same_account) == []

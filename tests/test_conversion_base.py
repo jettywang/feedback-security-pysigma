@@ -20,6 +20,7 @@ from sigma.exceptions import (
     SigmaBackendError,
     SigmaConditionError,
     SigmaPlaceholderError,
+    SigmaTransformationError,
     SigmaTypeError,
     SigmaValueError,
 )
@@ -1450,6 +1451,88 @@ def test_convert_compare_fields_contains_unsupported(test_backend, monkeypatch):
                         fieldA|fieldref|contains: fieldB
                     condition: sel
             """))
+
+
+def _fieldref_backend(mapping: dict) -> TextQueryTestBackend:
+    return TextQueryTestBackend(
+        ProcessingPipeline(
+            [ProcessingItem(FieldMappingTransformation(mapping), identifier="fieldref-mapping")]
+        )
+    )
+
+
+_FIELDREF_RULE = """
+title: Cross-account field reference
+status: test
+logsource:
+    category: test_category
+    product: test_product
+detection:
+    sel:
+        actor|fieldref: target
+    condition: sel
+"""
+
+
+def test_convert_field_reference_both_sides_mapped():
+    backend = _fieldref_backend({"actor": "user_id", "target": "other_user_id"})
+    assert backend.convert(SigmaCollection.from_yaml(_FIELDREF_RULE)) == [
+        "user_id=fieldref(other_user_id)"
+    ]
+
+
+def test_convert_field_reference_only_left_side_mapped():
+    backend = _fieldref_backend({"actor": "user_id"})
+    assert backend.convert(SigmaCollection.from_yaml(_FIELDREF_RULE)) == [
+        "user_id=fieldref(target)"
+    ]
+
+
+def test_convert_field_reference_only_right_side_mapped_keeps_reference():
+    backend = _fieldref_backend({"target": "other_user_id"})
+    assert backend.convert(SigmaCollection.from_yaml(_FIELDREF_RULE)) == [
+        "actor=fieldref(other_user_id)"
+    ]
+
+
+def test_convert_field_reference_left_one_to_many():
+    backend = _fieldref_backend({"actor": ["actor_a", "actor_b"], "target": "other_user_id"})
+    assert backend.convert(SigmaCollection.from_yaml(_FIELDREF_RULE)) == [
+        "actor_a=fieldref(other_user_id) or actor_b=fieldref(other_user_id)"
+    ]
+
+
+def test_convert_field_reference_right_one_to_many():
+    backend = _fieldref_backend({"actor": "user_id", "target": ["target_a", "target_b"]})
+    assert backend.convert(SigmaCollection.from_yaml(_FIELDREF_RULE)) == [
+        "user_id=fieldref(target_a) or user_id=fieldref(target_b)"
+    ]
+
+
+def test_convert_field_reference_both_one_to_many_rejected():
+    backend = _fieldref_backend(
+        {"actor": ["actor_a", "actor_b"], "target": ["target_a", "target_b"]}
+    )
+    with pytest.raises(SigmaTransformationError, match="can't be expressed unambiguously"):
+        backend.convert(SigmaCollection.from_yaml(_FIELDREF_RULE))
+
+
+def test_convert_field_reference_one_to_many_negation_preserved():
+    backend = _fieldref_backend({"actor": "user_id", "target": ["target_a", "target_b"]})
+    rule = """
+title: Negated field reference
+status: test
+logsource:
+    category: test_category
+    product: test_product
+detection:
+    sel:
+        actor|fieldref: target
+    condition: not sel
+"""
+    assert backend.convert(SigmaCollection.from_yaml(rule)) == [
+        "not (user_id=fieldref(target_a) or user_id=fieldref(target_b))"
+    ]
 
 
 def test_convert_compare_fields_wrong_type(test_backend):

@@ -17,6 +17,7 @@ from sigma.correlations import (
 from sigma.exceptions import (
     SigmaConfigurationError,
     SigmaRegularExpressionError,
+    SigmaRuleLocation,
     SigmaTransformationError,
     SigmaValueError,
     SigmaTypeError,
@@ -45,6 +46,7 @@ from sigma.types import (
     Placeholder,
     SigmaBool,
     SigmaExpansion,
+    SigmaFieldReference,
     SigmaNull,
     SigmaNumber,
     SigmaQueryExpression,
@@ -574,6 +576,152 @@ def test_field_mapping_none_preserves_existing_wildcards(dummy_pipeline):
     assert "*already*" in values_str
     assert "*partial*" in values_str
     assert "*other*" in values_str
+
+
+def _field_reference_rule() -> SigmaRule:
+    return SigmaRule.from_dict(
+        {
+            "title": "Field reference",
+            "logsource": {"category": "test"},
+            "detection": {
+                "sel": {"initiator|fieldref": "target"},
+                "condition": "sel",
+            },
+        }
+    )
+
+
+def _field_reference_detection_item(rule: SigmaRule) -> SigmaDetectionItem:
+    return rule.detection.detections["sel"].detection_items[0]
+
+
+def test_field_mapping_field_reference_both_sides_one_to_one(dummy_pipeline):
+    """Both sides of a field reference comparison are renamed but stay field references."""
+    rule = _field_reference_rule()
+    transformation = FieldMappingTransformation({"initiator": "actor", "target": "victim"})
+    transformation.set_pipeline(dummy_pipeline)
+    transformation.apply(rule)
+
+    detection_item = _field_reference_detection_item(rule)
+    assert detection_item.field == "actor"
+    assert detection_item.value == [SigmaFieldReference("victim")]
+
+
+def test_field_mapping_field_reference_only_left_side_mapped(dummy_pipeline):
+    """A renamed left side keeps an unmapped reference on the right side."""
+    rule = _field_reference_rule()
+    transformation = FieldMappingTransformation({"initiator": "actor"})
+    transformation.set_pipeline(dummy_pipeline)
+    transformation.apply(rule)
+
+    detection_item = _field_reference_detection_item(rule)
+    assert detection_item.field == "actor"
+    assert detection_item.value == [SigmaFieldReference("target")]
+
+
+def test_field_mapping_field_reference_only_right_side_mapped(dummy_pipeline):
+    """The referenced field is renamed but must not degrade into a plain string value."""
+    rule = _field_reference_rule()
+    transformation = FieldMappingTransformation({"target": "victim"})
+    transformation.set_pipeline(dummy_pipeline)
+    transformation.apply(rule)
+
+    detection_item = _field_reference_detection_item(rule)
+    assert detection_item.field == "initiator"
+    assert detection_item.value == [SigmaFieldReference("victim")]
+    assert all(isinstance(value, SigmaFieldReference) for value in detection_item.value)
+
+
+def test_field_mapping_field_reference_left_one_to_many(dummy_pipeline):
+    """A one-to-many left side is OR-expanded while the single reference is reused."""
+    rule = _field_reference_rule()
+    transformation = FieldMappingTransformation(
+        {"initiator": ["actor_a", "actor_b"], "target": "victim"}
+    )
+    transformation.set_pipeline(dummy_pipeline)
+    transformation.apply(rule)
+
+    detection = rule.detection.detections["sel"]
+    assert isinstance(detection.detection_items[0], SigmaDetection)
+    expanded = detection.detection_items[0].detection_items
+    assert [item.field for item in expanded] == ["actor_a", "actor_b"]
+    assert all(item.value == [SigmaFieldReference("victim")] for item in expanded)
+
+
+def test_field_mapping_field_reference_right_one_to_many(dummy_pipeline):
+    """A one-to-many reference becomes multiple OR-linked field references, not strings."""
+    rule = _field_reference_rule()
+    transformation = FieldMappingTransformation(
+        {"initiator": "actor", "target": ["victim_a", "victim_b"]}
+    )
+    transformation.set_pipeline(dummy_pipeline)
+    transformation.apply(rule)
+
+    detection_item = _field_reference_detection_item(rule)
+    assert detection_item.field == "actor"
+    assert detection_item.value == [
+        SigmaFieldReference("victim_a"),
+        SigmaFieldReference("victim_b"),
+    ]
+    assert detection_item.value_linking is ConditionOR
+    assert all(isinstance(value, SigmaFieldReference) for value in detection_item.value)
+
+
+def test_field_mapping_field_reference_both_one_to_many_rejected(dummy_pipeline):
+    """One-to-many mappings on both sides are ambiguous and must be rejected."""
+    rule = _field_reference_rule()
+    transformation = FieldMappingTransformation(
+        {
+            "initiator": ["actor_a", "actor_b"],
+            "target": ["victim_a", "victim_b"],
+        }
+    )
+    transformation.set_pipeline(dummy_pipeline)
+    with pytest.raises(SigmaTransformationError, match="can't be expressed unambiguously"):
+        transformation.apply(rule)
+
+
+def test_field_mapping_field_reference_both_one_to_many_error_keeps_source(dummy_pipeline):
+    """The ambiguity error points at the original rule location instead of the generated query."""
+    rule = _field_reference_rule()
+    source = SigmaRuleLocation(path="rules/cross-account.yml", line=8, char=5)
+    rule.detection.detections["sel"].detection_items[0].source = source
+    transformation = FieldMappingTransformation(
+        {
+            "initiator": ["actor_a", "actor_b"],
+            "target": ["victim_a", "victim_b"],
+        }
+    )
+    transformation.set_pipeline(dummy_pipeline)
+    with pytest.raises(SigmaTransformationError) as exc_info:
+        transformation.apply(rule)
+    assert exc_info.value.source == source
+    assert "cross-account.yml:8:5" in str(exc_info.value)
+
+
+def test_field_mapping_field_reference_preserves_startswith_endswith(dummy_pipeline):
+    """start/end/contains markers survive the reference field rename."""
+    rule = SigmaRule.from_dict(
+        {
+            "title": "Field reference modifiers",
+            "logsource": {"category": "test"},
+            "detection": {
+                "sel": {"initiator|fieldref|startswith": "target"},
+                "condition": "sel",
+            },
+        }
+    )
+    transformation = FieldMappingTransformation(
+        {"initiator": "actor", "target": ["victim_a", "victim_b"]}
+    )
+    transformation.set_pipeline(dummy_pipeline)
+    transformation.apply(rule)
+
+    detection_item = _field_reference_detection_item(rule)
+    assert detection_item.value == [
+        SigmaFieldReference("victim_a", starts_with=True),
+        SigmaFieldReference("victim_b", starts_with=True),
+    ]
 
 
 @pytest.fixture
