@@ -36,6 +36,7 @@ from sigma.correlations import (
 )
 from sigma.exceptions import (
     SigmaBackendError,
+    SigmaCIDRExpansionError,
     SigmaConversionError,
     SigmaError,
     SigmaFeatureNotSupportedByBackendError,
@@ -1188,6 +1189,9 @@ class TextQueryBackend(Backend):
         None  # CIDR expression query as format string with placeholders {field}, {value} (the whole CIDR value), {network} (network part only), {prefixlen} (length of network mask prefix) and {netmask} (CIDR network mask only)
     )
     not_cidr_expression: ClassVar[str | None] = None
+    cidr_expansion_budget: ClassVar[int] = (
+        100  # Maximum number of string match patterns a CIDR expression is expanded into if the backend has no native CIDR support. If more patterns are required or the network can't be expanded exactly, conversion fails with a SigmaFeatureNotSupportedByBackendError instead of emitting an incomplete or huge query.
+    )
 
     # Numeric comparison operators
     compare_op_expression: ClassVar[str | None] = (
@@ -2157,8 +2161,14 @@ class TextQueryBackend(Backend):
                 prefixlen=cidr.network.prefixlen,
                 netmask=cidr.network.netmask,
             )
-        else:  # No native CIDR support: expand into string wildcard matches on prefixes.
-            expanded = cidr.expand()
+        else:  # No native CIDR support: expand into exact string wildcard matches on prefixes.
+            try:
+                expanded = cidr.expand(max_patterns=self.cidr_expansion_budget)
+            except SigmaCIDRExpansionError as e:
+                raise SigmaFeatureNotSupportedByBackendError(
+                    f"CIDR expression '{cidr}' can't be converted into string matches: {e}",
+                    source=cond.source,
+                )
             expanded_cond = ConditionOR(
                 [
                     ConditionFieldEqualsValueExpression(cond.field, SigmaString(network))

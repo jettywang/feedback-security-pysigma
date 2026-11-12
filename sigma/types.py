@@ -5,7 +5,6 @@ from abc import ABC, abstractmethod
 from dataclasses import InitVar, dataclass, field
 from enum import Enum, auto
 from ipaddress import IPv4Network, IPv6Address, IPv6Network, ip_network
-from itertools import product
 from math import inf, isfinite
 from typing import (
     ClassVar,
@@ -24,6 +23,7 @@ if TYPE_CHECKING:
     from sigma.policy import SigmaPolicy
 
 from sigma.exceptions import (
+    SigmaCIDRExpansionError,
     SigmaPlaceholderError,
     SigmaRuleLocation,
     SigmaValueError,
@@ -937,92 +937,188 @@ class SigmaCIDRExpression(NoPlainConversionMixin, SigmaType):
     def __str__(self) -> str:
         return self.cidr
 
+    #: Default maximum number of patterns a CIDR expression is expanded into by expand().
+    max_expansion_patterns: ClassVar[int] = 100
+
     def expand(
         self,
-        wildcard: str = "*",
+        wildcard: str | None = "*",
+        max_patterns: int | None = None,
     ) -> list[str]:
         """
-        Convert CIDR range into a list of wildcard patterns or plain CIDR notation. The following parameters allow to change the behavior:
+        Convert CIDR range into a list of wildcard patterns or plain CIDR notation. The
+        generated patterns represent the network exactly: each pattern is either a literal
+        address or a literal prefix with a single trailing wildcard, so matching the patterns
+        neither misses addresses of the network nor matches addresses outside of it. The
+        following parameters allow to change the behavior:
 
         * wildcard: string that should be output as wildcard. Usually not required because this is
           passed to SigmaString that generates a wildcard pecial character from '*' that is
           converted into possible individual wildcard characters.
+        * max_patterns: maximum number of patterns the CIDR expression may be expanded into. If
+          more patterns are required, a SigmaCIDRExpansionError is raised before the patterns
+          are generated; the result is never truncated to fit into the budget. Defaults to the
+          class variable max_expansion_patterns.
 
         Setting wildcard to None indicates that this feature is not need and the query language handles CIDR notation properly.
+
+        Raises a SigmaCIDRExpansionError if the network can't be expanded into exact patterns
+        within the pattern budget.
         """
         if (
             wildcard is None
         ):  # The query language handles CIDR notation properly: return the network itself in CIDR notation
             return [str(self.network)]
 
+        if max_patterns is None:
+            max_patterns = self.max_expansion_patterns
+
+        if isinstance(self.network, IPv4Network):
+            return self._expand_ipv4(wildcard, max_patterns)
+        else:
+            return self._expand_ipv6(wildcard, max_patterns)
+
+    def _expand_ipv4(self, wildcard: str, max_patterns: int) -> list[str]:
+        """
+        Expand an IPv4 network into exact wildcard patterns. Algorithm: each group of an IPv4
+        address represents 8 bit. Therefore, we align to 8 bit boundaries, iterate over the
+        remaining bits and put a wildcard at the end (if not /32). Each generated pattern
+        matches exactly the addresses of one of these subnetworks, assuming the matched field
+        contains addresses in canonical dotted quad notation.
+        """
+        prefix_diff = (8 - self.network.prefixlen % 8) % 8
+        # Each byte-aligned subnetwork requires one pattern. Determined arithmetically
+        # before any pattern is generated.
+        required = 2**prefix_diff
+        if required > max_patterns:
+            raise SigmaCIDRExpansionError(
+                f"CIDR network {self.network} requires expansion into {required} patterns, "
+                f"which exceeds the maximum of {max_patterns} patterns.",
+                source=self.source,
+            )
         patterns = []
-        if isinstance(
-            self.network, IPv4Network
-        ):  # IPv4, algorithm: each group of an IPv4 address represents 8 bit. Therefore, we align to 8 bit boundaries, iterate over the remaining bits and put a wildcard at the end (if not /32)
-            prefix_rem8 = (
-                self.network.prefixlen % 8
-            )  # This variable stores the number of bits exceeding the previous 8 bit boundary
-            prefix_diff = (
-                8 - prefix_rem8
-            ) % 8  # We want the next 8 bit boundary to expand into smaller subnets, therefore the other side of the remainder is used.
-            for subnet in self.network.subnets(
-                prefix_diff
-            ):  # Generate all the subnetworks where the prefix ends at the next 8 bit boundary
-                wildcard_group = (
-                    subnet.prefixlen // 8
-                )  # Determine group that has to be replaced with wildcard: 8 bit boundary before prefix
-                subnet_groups = str(subnet.network_address).split(".")
-                if wildcard_group == 0:  # Not all groups are static, add wildcard
-                    patterns.append(wildcard)
-                elif wildcard_group < 4:  # Not all groups are static, add wildcard
-                    patterns.append(".".join(subnet_groups[:wildcard_group]) + "." + wildcard)
-                else:  # /32 - no wildcard is set
-                    patterns.append(
-                        str(subnet.network_address)
-                    )  # Return single address subnet without wildcard
-        else:  # IPv6, algorithm: each hex digit of an IPv6 address represents 4 bit. Therefore, we align to 4 bit boundaries and iterate over the remaining bits.
-            prefix_rem4 = (
-                self.network.prefixlen % 4
-            )  # This variable stores the number of bits exceeding the previous 4 bit boundary
-            prefix_diff = (
-                4 - prefix_rem4
-            ) % 4  # We want the next 4 bit boundary to expand into smaller subnets, therefore the other side of the remainder is used.
-            for subnet_v6 in self.network.subnets(
-                prefix_diff
-            ):  # Generate all the subnetworks where the prefix ends at the next 4 bit boundary
-                for pattern in self._expand_ipv6_subnet(subnet_v6, wildcard):
-                    if pattern not in patterns:
-                        patterns.append(pattern)
-            # Remove patterns that are covered by another pattern ending with a wildcard.
-            patterns = [
-                pattern
-                for pattern in patterns
-                if not any(
-                    other != pattern
-                    and other.endswith(wildcard)
-                    and pattern.startswith(other[: -len(wildcard)])
-                    for other in patterns
+        for subnet in self.network.subnets(
+            prefix_diff
+        ):  # Generate all the subnetworks where the prefix ends at the next 8 bit boundary
+            wildcard_group = (
+                subnet.prefixlen // 8
+            )  # Determine group that has to be replaced with wildcard: 8 bit boundary before prefix
+            subnet_groups = str(subnet.network_address).split(".")
+            if wildcard_group == 0:  # No static group, match everything
+                patterns.append(wildcard)
+            elif wildcard_group < 4:  # Not all groups are static, add wildcard
+                patterns.append(".".join(subnet_groups[:wildcard_group]) + "." + wildcard)
+            else:  # /32 - no wildcard is set
+                patterns.append(
+                    str(subnet.network_address)
+                )  # Return single address subnet without wildcard
+        return patterns
+
+    def _expand_ipv6(self, wildcard: str, max_patterns: int) -> list[str]:
+        """
+        Expand an IPv6 network into exact wildcard patterns. Algorithm: align the prefix to 16
+        bit group boundaries by iterating over the remaining bits and generate exact patterns
+        for each aligned subnetwork with _expand_ipv6_aligned_subnet. The address is not
+        treated as a plain colon-separated string: no single-character or infix wildcards are
+        generated, because these would also match addresses outside of the network.
+        """
+        prefix_diff = (16 - self.network.prefixlen % 16) % 16
+        # Each group-aligned subnetwork requires at least one pattern. Determined
+        # arithmetically before any pattern is generated.
+        required = 2**prefix_diff
+        if required > max_patterns:
+            raise SigmaCIDRExpansionError(
+                f"CIDR network {self.network} requires expansion into at least {required} "
+                f"patterns, which exceeds the maximum of {max_patterns} patterns.",
+                source=self.source,
+            )
+        patterns: list[str] = []
+        for subnet in self.network.subnets(prefix_diff):
+            for pattern in self._expand_ipv6_aligned_subnet(subnet, wildcard):
+                if pattern not in patterns:
+                    patterns.append(pattern)
+            if len(patterns) > max_patterns:
+                raise SigmaCIDRExpansionError(
+                    f"CIDR network {self.network} requires expansion into more than "
+                    f"{max_patterns} patterns.",
+                    source=self.source,
                 )
+        return patterns
+
+    def _expand_ipv6_aligned_subnet(self, subnet: IPv6Network, wildcard: str) -> list[str]:
+        """
+        Generate wildcard patterns that exactly match all textual representations (RFC 5952
+        compressed as well as uncompressed, as written e.g. by Sysmon network events) of the
+        addresses of an IPv6 network whose prefix length is a multiple of 16, i.e. covers
+        whole address groups.
+
+        Two pattern shapes are used, both with the wildcard at the end only:
+
+        * the fixed groups followed by a wildcard, matching all representations in which the
+          fixed groups appear literally, and
+        * if the fixed groups end with one or two zero groups, the groups before this zero run
+          followed by "::" and a wildcard, matching representations in which the trailing zero
+          groups are compressed together with zero groups of the host part.
+
+        A SigmaCIDRExpansionError is raised if the network can't be represented exactly this
+        way:
+
+        * two or more consecutive zero groups within (not at the end of) the fixed groups are
+          compressed to "::" in the textual representation of some addresses and appear
+          literally in others; the compressed form can't be matched without also matching
+          addresses outside of the network.
+        * more than two trailing zero groups: "::" always compresses at least two groups, so a
+          pattern can't fix more than the first two of them and would also match addresses
+          outside of the network.
+        """
+        if subnet.prefixlen == 128:  # single address: match compressed and uncompressed form
+            compressed = str(subnet.network_address)
+            uncompressed = ":".join(
+                format(int(group, 16), "x")
+                for group in SigmaCIDRExpression._ipv6_groups(subnet.network_address)
+            )
+            return [compressed] if compressed == uncompressed else [compressed, uncompressed]
+
+        fixed_groups = [
+            format(int(group, 16), "x")
+            for group in SigmaCIDRExpression._ipv6_groups(subnet.network_address)[
+                : subnet.prefixlen // 16
             ]
-            # Some log sources, e.g. Sysmon network events, write IPv6 addresses uncompressed.
-            # Add patterns for this representation that are not already covered by the RFC 5952
-            # patterns above.
-            uncompressed: list[str] = []
-            for subnet_v6 in self.network.subnets(prefix_diff):
-                for pattern in self._expand_ipv6_subnet_uncompressed(subnet_v6, wildcard):
-                    if pattern not in uncompressed:
-                        uncompressed.append(pattern)
-            patterns += [
-                pattern
-                for pattern in uncompressed
-                if pattern not in patterns
-                and not any(
-                    other != pattern
-                    and other.endswith(wildcard)
-                    and pattern.startswith(other[: -len(wildcard)])
-                    for other in patterns + uncompressed
-                )
-            ]
+        ]
+        if not fixed_groups:  # /0: matches everything
+            return [wildcard]
+
+        # Length of the run of zero groups at the end of the fixed groups.
+        trailing_zeros = 0
+        for group in reversed(fixed_groups):
+            if group == "0":
+                trailing_zeros += 1
+            else:
+                break
+
+        static_groups = fixed_groups[: len(fixed_groups) - trailing_zeros]
+        if any(
+            first == "0" and second == "0"
+            for first, second in zip(static_groups, static_groups[1:])
+        ):
+            raise SigmaCIDRExpansionError(
+                f"CIDR network {self.network} can't be expanded exactly: prefix of subnetwork "
+                f"{subnet} contains consecutive zero groups, whose compression to '::' in "
+                "textual address representations can't be matched exactly by wildcard patterns.",
+                source=self.source,
+            )
+        if trailing_zeros > 2:
+            raise SigmaCIDRExpansionError(
+                f"CIDR network {self.network} can't be expanded exactly: prefix of subnetwork "
+                f"{subnet} ends with more than two zero groups, whose compression to '::' "
+                "can't be matched without also matching addresses outside of the network.",
+                source=self.source,
+            )
+
+        patterns = [":".join(fixed_groups) + ":" + wildcard]
+        if trailing_zeros:
+            static_prefix = ":".join(static_groups)
+            patterns.append((static_prefix + "::" if static_prefix else "::") + wildcard)
         return patterns
 
     @staticmethod
@@ -1035,126 +1131,6 @@ class SigmaCIDRExpression(NoPlainConversionMixin, SigmaType):
         """
         digits = format(int(address), "032x")
         return [digits[i : i + 4] for i in range(0, 32, 4)]
-
-    @staticmethod
-    def _expand_ipv6_subnet_uncompressed(subnet: IPv6Network, wildcard: str) -> list[str]:
-        """
-        Generate wildcard patterns that match the uncompressed textual representation written
-        by some log sources, e.g. Sysmon network events (all eight groups, lower case, no
-        leading zeros, no :: compression, e.g. 0:0:0:0:0:0:0:1 for ::1), of all addresses of an
-        IPv6 network whose prefix length is a multiple of 4. Groups are handled like in
-        _expand_ipv6_subnet.
-        """
-        fixed_groups, rem = divmod(subnet.prefixlen, 16)
-        fixed_nibbles = rem // 4
-        exploded = SigmaCIDRExpression._ipv6_groups(subnet.network_address)
-        fixed = [format(int(group, 16), "x") for group in exploded[:fixed_groups]]
-        if fixed_groups == 8:  # single address
-            return [":".join(fixed)]
-
-        if fixed_nibbles == 0:  # first group not covered by prefix
-            partial = [wildcard]
-        else:  # group partially covered by prefix
-            nibbles = exploded[fixed_groups][:fixed_nibbles]
-            free_digits = 4 - fixed_nibbles
-            if int(nibbles, 16) != 0:
-                partial = [nibbles.lstrip("0") + "?" * free_digits]
-            else:
-                partial = ["?" * n for n in range(1, free_digits + 1)]
-        # Everything after the first group not covered completely by the prefix is a wildcard.
-        rest = [wildcard] if fixed_nibbles > 0 and fixed_groups < 7 else []
-        return [":".join(fixed + [group] + rest) for group in partial]
-
-    @staticmethod
-    def _expand_ipv6_subnet(subnet: IPv6Network, wildcard: str) -> list[str]:
-        """
-        Generate wildcard patterns that match the textual representation (RFC 5952: lower case,
-        no leading zeros, the longest run of at least two zero groups compressed to ::) of all
-        addresses of an IPv6 network whose prefix length is a multiple of 4.
-
-        The textual representation depends on which groups are zero, because of the :: compression.
-        Therefore, all possible combinations of zero and non-zero groups are enumerated and the
-        resulting pattern is generated for each of them. Groups covered completely by the prefix
-        are emitted as they are, a group covered partially by the prefix is emitted as fixed digits
-        followed by single-character wildcards for the remaining digits, and groups not covered by
-        the prefix are emitted as wildcard.
-
-        Wildcards can't express the number of groups compressed by :: and single-character
-        wildcards also match a colon. Therefore, the patterns still match some addresses outside
-        of the network, e.g. if the :: of a pattern must cover more than two zero groups. Backends
-        should prefer native CIDR matching where available.
-        """
-        if subnet.prefixlen == 128:  # single address
-            return [str(subnet.network_address)]
-
-        fixed_groups, rem = divmod(subnet.prefixlen, 16)
-        fixed_nibbles = rem // 4
-        exploded = SigmaCIDRExpression._ipv6_groups(subnet.network_address)
-
-        # For each group: list of possible textual representations if the group is not part of
-        # the compressed zero run and whether the group can be zero / non-zero.
-        group_texts: list[list[str]] = []
-        can_be_zero: list[bool] = []
-        can_be_nonzero: list[bool] = []
-        for i, group in enumerate(exploded):
-            if i < fixed_groups:  # group is completely covered by the prefix
-                value = int(group, 16)
-                group_texts.append([format(value, "x")])
-                can_be_zero.append(value == 0)
-                can_be_nonzero.append(value != 0)
-            elif i == fixed_groups and fixed_nibbles > 0:  # group is partially covered by prefix
-                nibbles = group[:fixed_nibbles]
-                free_digits = 4 - fixed_nibbles
-                # Fixed digits are non-zero: the digit count is fixed, but leading zeros are
-                # omitted (e.g. fixed "0a" with two free digits is written as "a??")
-                if int(nibbles, 16) != 0:
-                    group_texts.append([nibbles.lstrip("0") + "?" * free_digits])
-                    can_be_zero.append(False)
-                else:  # group value is below 16**free_digits: 1 up to free_digits digits
-                    group_texts.append(["?" * n for n in range(1, free_digits + 1)])
-                    can_be_zero.append(True)
-                can_be_nonzero.append(True)
-            else:  # group not covered by prefix
-                group_texts.append([wildcard])
-                can_be_zero.append(True)
-                can_be_nonzero.append(True)
-
-        patterns: dict[str, None] = {}  # insertion-ordered de-duplication
-        for zero_groups in product(*([False, True] for _ in range(8))):
-            if any(
-                (is_zero and not can_be_zero[i]) or (not is_zero and not can_be_nonzero[i])
-                for i, is_zero in enumerate(zero_groups)
-            ):
-                continue
-
-            # Determine the zero run that is compressed to :: (longest, first one on ties, at least
-            # two groups).
-            run_start, run_len = 0, 0
-            i = 0
-            while i < 8:
-                if zero_groups[i]:
-                    j = i
-                    while j < 8 and zero_groups[j]:
-                        j += 1
-                    if j - i > run_len:
-                        run_start, run_len = i, j - i
-                    i = j
-                else:
-                    i += 1
-
-            for texts in product(*group_texts):
-                if run_len >= 2:
-                    pattern = (
-                        ":".join(texts[:run_start]) + "::" + ":".join(texts[run_start + run_len :])
-                    )
-                else:
-                    pattern = ":".join(texts)
-                # Everything after a wildcard that is not preceded by :: is covered by the wildcard.
-                wildcard_pos = pattern.find(wildcard)
-                if wildcard_pos >= 0 and "::" not in pattern[:wildcard_pos]:
-                    pattern = pattern[: wildcard_pos + len(wildcard)]
-                patterns[pattern] = None
-        return list(patterns)
 
 
 class CompareOperators(Enum):

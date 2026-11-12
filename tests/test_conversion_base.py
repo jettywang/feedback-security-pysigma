@@ -19,7 +19,9 @@ from sigma.processing.transformations import (
 from sigma.exceptions import (
     SigmaBackendError,
     SigmaConditionError,
+    SigmaFeatureNotSupportedByBackendError,
     SigmaPlaceholderError,
+    SigmaRuleLocation,
     SigmaTypeError,
     SigmaValueError,
 )
@@ -1239,6 +1241,7 @@ def test_convert_value_cidr_wildcard_expression_other(test_backend, monkeypatch)
 def test_convert_value_cidr_wildcard_expression_ipv6(test_backend, monkeypatch):
     monkeypatch.setattr(test_backend, "cidr_expression", None)
     monkeypatch.setattr(test_backend, "add_escaped", "")
+    patterns = ", ".join(f'"1234:5678:0:ab{group:02x}:*"' for group in range(0x40))
     assert (
         test_backend.convert(SigmaCollection.from_yaml("""
                     title: Test
@@ -1251,10 +1254,71 @@ def test_convert_value_cidr_wildcard_expression_ipv6(test_backend, monkeypatch):
                             fieldA|cidr: 1234:5678:0:ab00::/58
                         condition: sel
                 """))
-        == [
-            'mappedA in ("1234:5678:0:ab0?:*", "1234:5678:0:ab1?:*", "1234:5678:0:ab2?:*", "1234:5678:0:ab3?:*")'
-        ]
+        == [f"mappedA in ({patterns})"]
     )
+
+
+def test_convert_value_cidr_expansion_budget_exceeded(test_backend, monkeypatch):
+    """Expansion of a /9 requires 128 patterns and is refused instead of truncated."""
+    monkeypatch.setattr(test_backend, "cidr_expression", None)
+    with pytest.raises(
+        SigmaFeatureNotSupportedByBackendError,
+        match="CIDR expression '10.0.0.0/9' can't be converted into string matches",
+    ):
+        test_backend.convert(SigmaCollection.from_yaml("""
+                    title: Test
+                    status: test
+                    logsource:
+                        category: test_category
+                        product: test_product
+                    detection:
+                        sel:
+                            fieldA|cidr: 10.0.0.0/9
+                        condition: sel
+                """))
+
+
+def test_convert_value_cidr_expansion_budget_configurable(test_backend, monkeypatch):
+    monkeypatch.setattr(test_backend, "cidr_expression", None)
+    monkeypatch.setattr(test_backend, "cidr_expansion_budget", 2)
+    with pytest.raises(SigmaFeatureNotSupportedByBackendError, match="exceeds the maximum of 2"):
+        test_backend.convert(SigmaCollection.from_yaml("""
+                    title: Test
+                    status: test
+                    logsource:
+                        category: test_category
+                        product: test_product
+                    detection:
+                        sel:
+                            fieldA|cidr: 192.168.0.0/14
+                        condition: sel
+                """))
+
+
+def test_convert_value_cidr_expansion_not_exact_ipv6(test_backend, monkeypatch):
+    """IPv6 networks that can't be expanded exactly are refused with the rule location."""
+    monkeypatch.setattr(test_backend, "cidr_expression", None)
+    source = SigmaRuleLocation("test.yml", 9, 5)
+    with pytest.raises(
+        SigmaFeatureNotSupportedByBackendError, match="can't be converted into string matches"
+    ) as exc_info:
+        test_backend.convert(
+            SigmaCollection.from_yaml(
+                """
+                    title: Test
+                    status: test
+                    logsource:
+                        category: test_category
+                        product: test_product
+                    detection:
+                        sel:
+                            fieldA|cidr: 2001:db8::/112
+                        condition: sel
+                """,
+                source=source,
+            )
+        )
+    assert exc_info.value.source == source
 
 
 def test_convert_compare(test_backend):

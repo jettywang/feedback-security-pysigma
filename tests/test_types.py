@@ -1,10 +1,11 @@
 import re
 from fnmatch import fnmatchcase
-from ipaddress import IPv4Network, IPv6Address, IPv6Network
+from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network
 
 import pytest
 
 from sigma.exceptions import (
+    SigmaCIDRExpansionError,
     SigmaPlaceholderError,
     SigmaTypeError,
     SigmaValueError,
@@ -911,9 +912,40 @@ def test_cidr_expand_ipv6_0():
     assert SigmaCIDRExpression("::/0").expand() == ["*"]
 
 
-def test_cidr_expand_ipv6_56():
-    # Group ab00-abff always has 4 digits: ab* would also match e.g. 1234:5678:0:ab:1::
-    assert SigmaCIDRExpression("1234:5678:0:ab00::/56").expand() == ["1234:5678:0:ab??:*"]
+def test_cidr_expand_ipv4_budget_exceeded():
+    """A /9 requires 128 byte-aligned patterns, which exceeds the default budget."""
+    with pytest.raises(SigmaCIDRExpansionError, match="128 patterns"):
+        SigmaCIDRExpression("10.0.0.0/9").expand()
+
+
+def test_cidr_expand_ipv4_budget_configurable():
+    patterns = SigmaCIDRExpression("10.0.0.0/9").expand(max_patterns=128)
+    assert len(patterns) == 128
+    assert patterns[0] == "10.0.*"
+    assert patterns[-1] == "10.127.*"
+
+
+def test_cidr_expand_no_truncation():
+    """Expansion never returns a truncated result: exceeding the budget is an error."""
+    with pytest.raises(SigmaCIDRExpansionError):
+        SigmaCIDRExpression("0.0.0.0/1").expand(max_patterns=64)
+
+
+def test_cidr_expand_ipv6_56_budget_exceeded():
+    """A /56 requires 256 group-aligned patterns, which exceeds the default budget."""
+    with pytest.raises(SigmaCIDRExpansionError, match="256 patterns"):
+        SigmaCIDRExpression("1234:5678:0:ab00::/56").expand()
+
+
+def test_cidr_expand_ipv6_56_budget_configurable():
+    patterns = SigmaCIDRExpression("1234:5678:0:ab00::/56").expand(max_patterns=256)
+    assert patterns == [f"1234:5678:0:ab{group:02x}:*" for group in range(0x100)]
+
+
+def test_cidr_expand_ipv6_stops_before_generating_huge_networks():
+    """The required pattern count is determined arithmetically before any pattern is generated."""
+    with pytest.raises(SigmaCIDRExpansionError, match="32768"):
+        SigmaCIDRExpression("2001:8000::/17").expand(max_patterns=1000)
 
 
 def test_cidr_expand_ipv6_64_compressed():
@@ -921,21 +953,32 @@ def test_cidr_expand_ipv6_64_compressed():
     assert SigmaCIDRExpression("2001:db8::/64").expand() == ["2001:db8:0:0:*", "2001:db8::*"]
 
 
-def test_cidr_expand_ipv6_112():
-    assert SigmaCIDRExpression("2001:db8::/112").expand() == [
-        "2001:db8::*",
-        "2001:db8:0:0:0:0:0:*",
+def test_cidr_expand_ipv6_64_single_trailing_zero_group():
+    assert SigmaCIDRExpression("2001:db8:1:0::/64").expand() == [
+        "2001:db8:1:0:*",
+        "2001:db8:1::*",
     ]
 
 
-def test_cidr_expand_ipv6_120():
-    assert SigmaCIDRExpression("2001:db8::/120").expand() == [
-        "2001:db8::?",
-        "2001:db8::??",
-        "2001:db8::",
-        "2001:db8:0:0:0:0:0:?",
-        "2001:db8:0:0:0:0:0:??",
-    ]
+def test_cidr_expand_ipv6_16():
+    assert SigmaCIDRExpression("::/16").expand() == ["0:*", "::*"]
+
+
+def test_cidr_expand_ipv6_112_not_exact():
+    """More than two trailing zero groups can't be matched exactly: :: compresses >= 2 groups."""
+    with pytest.raises(SigmaCIDRExpansionError, match="more than two zero groups"):
+        SigmaCIDRExpression("2001:db8::/112").expand()
+
+
+def test_cidr_expand_ipv6_inner_zero_groups_not_exact():
+    """Zero group sequences within the prefix are compressed depending on the host part."""
+    with pytest.raises(SigmaCIDRExpansionError, match="consecutive zero groups"):
+        SigmaCIDRExpression("2001:0:0:1::/64").expand()
+
+
+def test_cidr_expand_ipv6_120_budget_exceeded():
+    with pytest.raises(SigmaCIDRExpansionError, match="256 patterns"):
+        SigmaCIDRExpression("2001:db8::/120").expand()
 
 
 def test_cidr_expand_ipv6_128_compressed():
@@ -949,86 +992,11 @@ def test_cidr_expand_ipv6_128_not_compressed():
     assert SigmaCIDRExpression("2001:db8:1:2:3:4:5:6/128").expand() == ["2001:db8:1:2:3:4:5:6"]
 
 
-@pytest.mark.parametrize(
-    "cidr,expected",
-    [
-        ("::1/128", ["::1", "0:0:0:0:0:0:0:1"]),
-        ("::ffff:0:0/96", ["::ffff:*:*", "0:0:0:0:0:ffff:*"]),
-        (
-            "::ffff:0:0/104",
-            ["::ffff:?:*", "::ffff:??:*", "0:0:0:0:0:ffff:?:*", "0:0:0:0:0:ffff:??:*"],
-        ),
-        ("64:ff9b::/96", ["64:ff9b::*", "64:ff9b:0:0:0:0:*"]),
-        ("100::/64", ["100::*", "100:0:0:0:*"]),
-        # uncompressed form already covered by the RFC 5952 patterns
-        ("2001:db8::/64", ["2001:db8:0:0:*", "2001:db8::*"]),
-        ("fe80::/10", ["fe8?:*", "fe9?:*", "fea?:*", "feb?:*"]),
-    ],
-)
-def test_cidr_expand_ipv6_uncompressed(cidr, expected):
-    """Sysmon network events write IPv6 addresses without :: compression."""
-    assert SigmaCIDRExpression(cidr).expand() == expected
-
-
-@pytest.mark.parametrize(
-    "cidr,expected",
-    [
-        # zero groups compressed in network but not in all addresses
-        (
-            "2001:db8:0:0:1::/80",
-            ["2001:db8::1:*:*:*", "2001:db8:0:0:1::", "2001:db8:0:0:1:*"],
-        ),
-        ("2001:0:0:1::/64", ["2001::1:*:*:*:*", "2001:0:0:1:*"]),
-        # leading zeros are not written, partially covered groups need an exact digit count
-        ("2001:db8:1000::/36", ["2001:db8:1???:*"]),
-        ("fe80::/10", ["fe8?:*", "fe9?:*", "fea?:*", "feb?:*"]),
-    ],
-)
-def test_cidr_expand_ipv6_prefix_not_truncated(cidr, expected):
-    assert SigmaCIDRExpression(cidr).expand() == expected
-
-
-@pytest.mark.parametrize(
-    "cidr,inside,outside",
-    [
-        (
-            "2001:db8:0:0:1::/80",
-            ["2001:db8::1:0:0:1", "2001:db8::1:a:b:c", "2001:db8:0:0:1::"],
-            ["2001:db8:ffff::1", "2001:db8::2:0:0:1", "2001:db8::1", "2001:db8:1::1"],
-        ),
-        (
-            "2001:0:0:1::/64",
-            ["2001:0:0:1::1", "2001:0:0:1::", "2001::1:0:1:0:1", "2001::1:a:b:c:d"],
-            ["2001:abcd::1", "2001::1", "2001:0:0:2::"],
-        ),
-        (
-            "2001:db8:1000::/36",
-            ["2001:db8:1000::", "2001:db8:1fff:ffff::1", "2001:db8:1abc:1:2:3:4:5"],
-            ["2001:db8:1::", "2001:db8:1:2:3:4:5:6", "2001:db8:160:1:2:3:4:5", "2001:db8:2000::"],
-        ),
-        (
-            "2001:db8::/64",
-            ["2001:db8::", "2001:db8::1", "2001:db8:0:0:1::", "2001:db8::1:2:3:4"],
-            ["2001:db8:1::", "2001:db9::1"],
-        ),
-    ],
-)
-def test_cidr_expand_ipv6_matches(cidr, inside, outside):
-    """
-    Patterns match the RFC 5952 representation of addresses inside the network and reject the
-    listed outside addresses. Wildcard patterns can still match some other outside addresses
-    (see SigmaCIDRExpression._expand_ipv6_subnet), so this is not a proof of strict correctness.
-    """
-    patterns = SigmaCIDRExpression(cidr).expand()
-    network = IPv6Network(cidr)
-    for address in inside:
-        assert str(IPv6Address(address)) == address  # RFC 5952 representation
-        assert IPv6Address(address) in network
-        assert any(fnmatchcase(address, pattern) for pattern in patterns), address
-    for address in outside:
-        assert str(IPv6Address(address)) == address
-        assert IPv6Address(address) not in network
-        assert not any(fnmatchcase(address, pattern) for pattern in patterns), address
+def test_cidr_expand_ipv6_10():
+    """Non-group-aligned prefixes are expanded into group-aligned subnetworks."""
+    assert SigmaCIDRExpression("fe80::/10").expand() == [
+        f"fe{group:02x}:*" for group in range(0x80, 0xC0)
+    ]
 
 
 def test_cidr_expand_ipv6_128_ipv4_mapped_uncompressed():
@@ -1038,51 +1006,89 @@ def test_cidr_expand_ipv6_128_ipv4_mapped_uncompressed():
 
 def _uncompressed(address):
     """Uncompressed representation, as written by Sysmon: 0:0:0:0:0:0:0:1 for ::1"""
-    return ":".join(format(int(group, 16), "x") for group in address.exploded.split(":"))
+    digits = format(int(address), "032x")
+    return ":".join(format(int(digits[i : i + 4], 16), "x") for i in range(0, 32, 4))
+
+
+def _expansion_boundary_addresses(network):
+    """
+    Independent criterion built with the ipaddress module: addresses just inside and outside
+    of the network boundaries, addresses with a single bit set or cleared at every host
+    position (covers all zero group run positions and therefore all '::' compression
+    variants) and addresses with one prefix bit flipped (guaranteed to be outside).
+    """
+    first = int(network.network_address)
+    last = int(network.broadcast_address)
+    host_bits = network.max_prefixlen - network.prefixlen
+    inside = {first, last}
+    for bit in range(host_bits):
+        inside.add(first | (1 << bit))
+        inside.add(last & ~(1 << bit))
+    outside = set()
+    if first > 0:
+        outside.add(first - 1)
+    if last < 2**network.max_prefixlen - 1:
+        outside.add(last + 1)
+    for bit in range(host_bits, network.max_prefixlen):
+        outside.add(first ^ (1 << bit))
+    address_class = IPv4Address if network.version == 4 else IPv6Address
+    return (
+        [address_class(value) for value in inside],
+        [address_class(value) for value in outside],
+    )
 
 
 @pytest.mark.parametrize(
-    "cidr,inside,outside",
+    "cidr",
     [
-        ("::1/128", ["::1"], ["::", "::2", "::1:0", "1::1"]),
-        ("2620:1ec:4::152/128", ["2620:1ec:4::152"], ["2620:1ec:4::153", "2620:1ec:4:0:1::152"]),
-        (
-            "64:ff9b::/96",
-            ["64:ff9b::", "64:ff9b::102:304", "64:ff9b::ffff:ffff"],
-            ["64:ff9b:1::", "64:ff9a::102:304", "::102:304"],
-        ),
-        (
-            "2001:db8:0:0:1::/80",
-            ["2001:db8::1:0:0:1", "2001:db8::1:a:b:c", "2001:db8:0:0:1::"],
-            ["2001:db8:ffff::1", "2001:db8::2:0:0:1", "2001:db8::1", "2001:db8:1::1"],
-        ),
-        (
-            "2001:db8::/120",
-            ["2001:db8::", "2001:db8::1", "2001:db8::ff"],
-            ["2001:db8::100", "2001:db8::1:0", "2001:db8:1::"],
-        ),
-        (
-            "2001:db8:1000::/36",
-            ["2001:db8:1000::", "2001:db8:1fff:ffff::1", "2001:db8:1abc:1:2:3:4:5"],
-            ["2001:db8:1::", "2001:db8:1:2:3:4:5:6", "2001:db8:160:1:2:3:4:5", "2001:db8:2000::"],
-        ),
+        "0.0.0.0/0",
+        "10.0.0.0/7",
+        "192.0.0.0/8",
+        "192.168.0.0/14",
+        "192.168.0.0/23",
+        "192.168.1.0/24",
+        "192.168.1.0/31",
+        "192.168.1.1/32",
+        "::/0",
+        "::/16",
+        "::/32",
+        "2001:db8::/64",
+        "2001:db8:1:0::/64",
+        "1234:5678:0:ab00::/58",
+        "1234:5678:0:ab00::/64",
+        "fe80::/10",
+        "::1/128",
+        "2001:db8::1/128",
+        "2001:db8:1:2:3:4:5:6/128",
+        "::ffff:102:304/128",
     ],
 )
-def test_cidr_expand_ipv6_matches_uncompressed(cidr, inside, outside):
+def test_cidr_expand_exact(cidr):
     """
-    Patterns match the RFC 5952 and the uncompressed representation of addresses inside the
-    network and reject both representations of the listed outside addresses.
+    Proof with independent ipaddress-based criteria: the expanded patterns match the textual
+    representations of all sampled addresses inside the network (no false negatives) and
+    reject all sampled addresses outside of it (no widening of the network range). For IPv6
+    both the RFC 5952 and the uncompressed representation are checked.
     """
-    patterns = SigmaCIDRExpression(cidr).expand()
-    network = IPv6Network(cidr)
+    expression = SigmaCIDRExpression(cidr)
+    patterns = expression.expand()
+    network = expression.network
+    inside, outside = _expansion_boundary_addresses(network)
     for address in inside:
-        assert IPv6Address(address) in network
-        for text in (str(IPv6Address(address)), _uncompressed(IPv6Address(address))):
+        assert address in network
+        texts = (
+            [str(address)] if network.version == 4 else [str(address), _uncompressed(address)]
+        )
+        for text in texts:
             assert any(fnmatchcase(text, pattern) for pattern in patterns), text
     for address in outside:
-        assert IPv6Address(address) not in network
-        for text in (str(IPv6Address(address)), _uncompressed(IPv6Address(address))):
+        assert address not in network
+        texts = (
+            [str(address)] if network.version == 4 else [str(address), _uncompressed(address)]
+        )
+        for text in texts:
             assert not any(fnmatchcase(text, pattern) for pattern in patterns), text
+
 
 
 def test_cidr_expand_ipv6_without_wildcard():
@@ -1095,15 +1101,14 @@ def test_cidr_expand_ipv4_without_wildcard():
 
 def test_cidr_expand_ipv6_58():
     assert SigmaCIDRExpression("1234:5678:0:ab00::/58").expand() == [
-        "1234:5678:0:ab0?:*",
-        "1234:5678:0:ab1?:*",
-        "1234:5678:0:ab2?:*",
-        "1234:5678:0:ab3?:*",
+        f"1234:5678:0:ab{group:02x}:*" for group in range(0x40)
     ]
 
 
 def test_cidr_expand_ipv6_60():
-    assert SigmaCIDRExpression("1234:5678:0:ab00::/60").expand() == ["1234:5678:0:ab0?:*"]
+    assert SigmaCIDRExpression("1234:5678:0:ab00::/60").expand() == [
+        f"1234:5678:0:ab0{group:x}:*" for group in range(0x10)
+    ]
 
 
 def test_cidr_expand_ipv6_64():

@@ -214,6 +214,16 @@ class SigmaTypeError(SigmaModifierError):
     pass
 
 
+class SigmaCIDRExpansionError(SigmaValueError):
+    """
+    CIDR expression can't be expanded into an exact set of string match patterns, either
+    because the required number of patterns exceeds the configured expansion budget or because
+    the network can't be represented exactly by string wildcard patterns.
+    """
+
+    pass
+
+
 class SigmaValidatorConfigurationParsingError(SigmaError):
     """Error in parsing of a Sigma validation configuration file."""
 
