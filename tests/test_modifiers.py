@@ -242,9 +242,55 @@ def test_base64offset_nonascii(dummy_detection_item, value):
     (expansion,) = SigmaBase64OffsetModifier(dummy_detection_item, []).apply(SigmaString(value))
     assert isinstance(expansion, SigmaExpansion)
     data = value.encode()
-    for i, variant in enumerate(expansion.values):
+    for variant in expansion.values:
         assert str(variant) != ""
-        assert str(variant) in b64encode(i * b"x" + data + b"yyy").decode()
+        assert any(
+            str(variant) in b64encode(alignment * b"x" + data + b"yyy").decode()
+            for alignment in range(3)
+        )
+
+
+def test_base64offset_short_value_has_no_empty_variant(dummy_detection_item):
+    # Values that are too short have no complete six-bit character at some alignments. Those
+    # alignments must be omitted: an empty value would be turned into a match-all wildcard by
+    # the contains modifier.
+    (expansion,) = SigmaBase64OffsetModifier(dummy_detection_item, []).apply(SigmaString("a"))
+    assert isinstance(expansion, SigmaExpansion)
+    assert [str(variant) for variant in expansion.values] == ["Y", "h"]
+
+
+def test_base64offset_empty_value_is_rejected(dummy_detection_item):
+    with pytest.raises(SigmaValueError, match="empty string"):
+        SigmaBase64OffsetModifier(dummy_detection_item, []).apply(SigmaString(""))
+
+
+def test_base64offset_variants_are_independent_of_surrounding_bytes(dummy_detection_item):
+    # Each variant must be found no matter which bytes precede or follow the target. The
+    # reference build is described in tests/test_encoded_modifiers_semantics.py.
+    data = b"cmd.exe"
+    (expansion,) = SigmaBase64OffsetModifier(dummy_detection_item, []).apply(SigmaString("cmd.exe"))
+    assert isinstance(expansion, SigmaExpansion)
+    for alignment, variant in zip(range(3), expansion.values):
+        for prefix_byte in (0x00, 0x20, 0xFF):
+            assert str(variant) in b64encode(
+                bytes([prefix_byte]) * alignment + data + b"trailing"
+            ).decode()
+
+
+@pytest.mark.parametrize(
+    "modifier",
+    [
+        SigmaBase64Modifier,
+        SigmaBase64OffsetModifier,
+        SigmaWideModifier,
+        SigmaUTF16Modifier,
+        SigmaUTF16BEModifier,
+    ],
+)
+def test_encoder_after_cased_is_rejected(dummy_detection_item, modifier):
+    cased = SigmaCasedString.from_sigma_string(SigmaString("foobar"))
+    with pytest.raises(SigmaModifiedError, match="cased"):
+        modifier(dummy_detection_item, [SigmaCaseSensitiveModifier]).apply(cased)
 
 
 def test_base64offset_nonascii_expected(dummy_detection_item):

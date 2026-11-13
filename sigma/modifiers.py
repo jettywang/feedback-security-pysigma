@@ -208,6 +208,37 @@ def _group_regex_alternation(val: SigmaRegularExpression) -> str:
 
 
 ### Modifier Implementations ###
+def _check_exclusive_substring_modifiers(
+    modifier: type["SigmaModifier[Any, Any]"],
+    applied_modifiers: SequenceABC[type["SigmaModifier[Any, Any]"]],
+    source: SigmaRuleLocation | None,
+) -> None:
+    """
+    At most one of the modifiers that anchor a string against the surrounding log data may be
+    combined with another one. A second anchoring modifier is a no-op or silently replaces the
+    intent of the first one, e.g. contains|startswith ends up with the same value as contains. Such
+    an order must be rejected instead of silently losing one of the modifiers.
+    """
+    anchoring_modifiers = (
+        SigmaContainsModifier,
+        SigmaStartswithModifier,
+        SigmaEndswithModifier,
+    )
+    conflicting = [
+        modifier_class
+        for modifier_class in applied_modifiers
+        if modifier_class in anchoring_modifiers
+        and modifier_class is not modifier  # repeated appliance is reported by the validators
+    ]
+    if conflicting:
+        raise SigmaModifiedError(
+            "Modifiers that define how a value is anchored inside a longer string "
+            f"({', '.join(m.__name__ for m in anchoring_modifiers)}) must not be combined, but "
+            f"{modifier.__name__} was applied after {conflicting[-1].__name__}",
+            source=source,
+        )
+
+
 class SigmaContainsModifier(
     SigmaValueModifier[
         SigmaString | SigmaRegularExpression | SigmaFieldReference,
@@ -219,6 +250,7 @@ class SigmaContainsModifier(
     def modify(
         self, val: SigmaString | SigmaRegularExpression | SigmaFieldReference
     ) -> SigmaString | SigmaRegularExpression | SigmaFieldReference:
+        _check_exclusive_substring_modifiers(self.__class__, self.applied_modifiers, self.source)
         if isinstance(val, SigmaString):
             if not val.startswith(SpecialChars.WILDCARD_MULTI):
                 val = SpecialChars.WILDCARD_MULTI + val
@@ -248,6 +280,7 @@ class SigmaStartswithModifier(
     def modify(
         self, val: SigmaString | SigmaRegularExpression | SigmaFieldReference
     ) -> SigmaString | SigmaRegularExpression | SigmaFieldReference:
+        _check_exclusive_substring_modifiers(self.__class__, self.applied_modifiers, self.source)
         if isinstance(val, SigmaString):
             if not val.endswith(SpecialChars.WILDCARD_MULTI):
                 val += SpecialChars.WILDCARD_MULTI
@@ -272,6 +305,7 @@ class SigmaEndswithModifier(
     def modify(
         self, val: SigmaString | SigmaRegularExpression | SigmaFieldReference
     ) -> SigmaString | SigmaRegularExpression | SigmaFieldReference:
+        _check_exclusive_substring_modifiers(self.__class__, self.applied_modifiers, self.source)
         if isinstance(val, SigmaString):
             if not val.startswith(SpecialChars.WILDCARD_MULTI):
                 val = SpecialChars.WILDCARD_MULTI + val
@@ -298,10 +332,29 @@ def _base64_input_bytes(val: SigmaString, applied_modifiers: SequenceABC[type]) 
     return data
 
 
+def _check_no_case_sensitive_string(
+    modifier: type["SigmaModifier[Any, Any]"],
+    val: SigmaType,
+    source: SigmaRuleLocation | None,
+) -> None:
+    """
+    Encoding modifiers turn the case-sensitive marker of a preceding 'cased' modifier back into a
+    plain string because the encoded characters are no longer the case-sensitive value the author
+    wrote. Reject such a chain instead of silently dropping the case sensitivity.
+    """
+    if isinstance(val, SigmaCasedString):
+        raise SigmaModifiedError(
+            f"{modifier.__name__} can't follow the case-sensitive 'cased' modifier, the marker "
+            "would be silently lost",
+            source=source,
+        )
+
+
 class SigmaBase64Modifier(SigmaValueModifier[SigmaString, SigmaString]):
     """Encode string as Base64 value."""
 
     def modify(self, val: SigmaString) -> SigmaString:
+        _check_no_case_sensitive_string(self.__class__, val, self.source)
         if val.contains_special():
             raise SigmaValueError(
                 "Base64 encoding of strings with wildcards is not allowed",
@@ -316,33 +369,60 @@ class SigmaBase64OffsetModifier(SigmaValueModifier[SigmaString, SigmaExpansion])
     encoded form.
     """
 
-    start_offsets = (0, 2, 3)
-    end_offsets = (None, -3, -2)
-
     def modify(self, val: SigmaString) -> SigmaExpansion:
+        _check_no_case_sensitive_string(self.__class__, val, self.source)
         if val.contains_special():
             raise SigmaValueError(
                 "Base64 encoding of strings with wildcards is not allowed",
                 source=self.source,
             )
         data = _base64_input_bytes(val, self.applied_modifiers)
-        return SigmaExpansion(
-            [
-                SigmaString(
-                    b64encode(i * b" " + data)[
-                        # the cut depends on the encoded byte length, not the character count
-                        self.start_offsets[i] : self.end_offsets[(len(data) + i) % 3]
-                    ].decode()
-                )
-                for i in range(3)
-            ]
-        )
+        windows = _base64_offset_windows(data)
+        if not windows:  # empty target: every alignment would be a wildcard-only, match-all value
+            raise SigmaValueError(
+                "Base64 offset encoding of an empty string can't match anything",
+                source=self.source,
+            )
+        return SigmaExpansion([SigmaString(encoded) for encoded in windows])
+
+
+def _base64_offset_windows(data: bytes) -> list[str]:
+    """
+    Base64 fragments that occur in the encoded form of *data* independently of the surrounding
+    bytes for each of the three possible byte alignments of the start of *data*.
+
+    Only full six-bit characters whose bits are completely determined by *data* itself are
+    included. Characters at the boundaries can mix in bits of the unknown preceding bytes or of
+    the following bytes, so they are left out: the result is a contiguous middle section of the
+    encoded target. This keeps a fragment free of the alignment-dependent neighbouring bytes and
+    avoids emitting an empty fragment for values that are too short at a given alignment: an empty
+    fragment would be a wildcard-only value and match every Base64 blob. When no complete
+    character is available the alignment is simply absent instead of matching anything.
+    """
+    windows = list()
+    for alignment in range(3):
+        data_bits_start = 8 * alignment
+        data_bits_end = 8 * (alignment + len(data))
+        first_character = -(-data_bits_start // 6)  # first character starting inside data
+        last_character = data_bits_end // 6  # first character starting beyond data
+        covered = [
+            character
+            for character in range(first_character, last_character)
+            if 6 * character >= data_bits_start and 6 * character + 6 <= data_bits_end
+        ]
+        if not covered:  # no complete Base64 character at this alignment
+            continue
+        padding = (-(alignment + len(data))) % 3
+        canonical = b64encode(b"\x00" * alignment + data + b"\x00" * padding).decode()
+        windows.append(canonical[covered[0] : covered[-1] + 1])
+    return windows
 
 
 class SigmaWideModifier(SigmaValueModifier[SigmaString, SigmaString]):
     """Encode string as wide string (UTF-16LE)."""
 
     def modify(self, val: SigmaString) -> SigmaString:
+        _check_no_case_sensitive_string(self.__class__, val, self.source)
         r: list[SigmaStringPartType] = list()
         for item in val.s:
             if isinstance(
@@ -367,6 +447,7 @@ class SigmaUTF16BEModifier(SigmaValueModifier[SigmaString, SigmaString]):
     """Encode string as wide string (UTF-16BE)."""
 
     def modify(self, val: SigmaString) -> SigmaString:
+        _check_no_case_sensitive_string(self.__class__, val, self.source)
         r: list[SigmaStringPartType] = list()
         for item in val.s:
             if isinstance(item, str):
@@ -389,6 +470,7 @@ class SigmaUTF16Modifier(SigmaValueModifier[SigmaString, SigmaString]):
     """Encode string as wide string with BOM (UTF-16LE with BOM prefix)."""
 
     def modify(self, val: SigmaString) -> SigmaString:
+        _check_no_case_sensitive_string(self.__class__, val, self.source)
         r: list[SigmaStringPartType] = list()
         r.append("\ufeff")  # BOM
         for item in val.s:
